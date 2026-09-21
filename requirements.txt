@@ -1,0 +1,18 @@
+# 基本 (軽量 DSP モード + Web アプリ)
+numpy<2
+scipy
+librosa
+soundfile
+imageio-ffmpeg
+fastapi
+uvicorn
+python-multipart
+# YouTube URL 対応
+yt-dlp
+# 高精度モード (Spotify basic-pitch, ONNX 版)
+basic-pitch[onnx]
+setuptools<81
+# ボーカル分離モード (Meta Demucs)。約 650MB、初回にモデル約 80MB をダウンロード
+torch
+torchaudio
+demucs

@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8bit Music Converter</title>
+<link href="https://fonts.googleapis.com/css2?family=DotGothic16&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #1a1c2c; --panel: #29366f; --panel2: #3b5dc9; --ink: #f4f4f4; --dim: #94b0c2;
+    --acc: #ffcd75; --acc2: #38b764; --err: #b13e53; --border: #5d275d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; background: var(--bg); color: var(--ink);
+    font-family: "DotGothic16", "Hiragino Sans", "Noto Sans JP", sans-serif; font-size: 16px;
+    background-image:
+      linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+    background-size: 24px 24px;
+  }
+  main { max-width: 720px; margin: 0 auto; padding: 32px 16px 64px; }
+  h1 { font-size: 28px; margin: 0 0 4px; color: var(--acc); text-shadow: 3px 3px 0 #000; letter-spacing: 1px; }
+  .sub { color: var(--dim); margin: 0 0 24px; }
+  .panel { background: var(--panel); border: 4px solid #000; box-shadow: 6px 6px 0 #000; padding: 20px; margin-bottom: 20px; }
+  .drop {
+    border: 4px dashed var(--dim); padding: 36px 16px; text-align: center; cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+  .drop.over { background: rgba(255,205,117,.12); border-color: var(--acc); }
+  .drop p { margin: 6px 0; }
+  .drop .big { font-size: 20px; }
+  .drop .file { color: var(--acc); word-break: break-all; }
+  input[type=file] { display: none; }
+  button.mini { font: inherit; font-size: 13px; background: var(--panel2); color: var(--ink); border: 2px solid #000;
+                padding: 4px 10px; cursor: pointer; box-shadow: 2px 2px 0 #000; }
+  .or { text-align: center; color: var(--dim); margin: 14px 0 8px; }
+  .urlrow input { width: 100%; font: inherit; font-size: 15px; padding: 10px 12px; background: var(--bg); color: var(--ink);
+                  border: 3px solid #000; box-shadow: inset 2px 2px 0 #000; }
+  .urlrow input:focus { outline: 2px solid var(--acc); }
+  .opts { display: grid; grid-template-columns: 1fr 1fr; gap: 12px 24px; margin-top: 16px; }
+  .opts label { display: flex; align-items: center; gap: 8px; }
+  .opts select { font: inherit; background: var(--bg); color: var(--ink); border: 2px solid #000; padding: 4px 6px; }
+  .opts .full { grid-column: 1 / -1; }
+  details.adv summary { cursor: pointer; color: var(--acc); }
+  input[type=range] { width: 60%; vertical-align: middle; }
+  button.go {
+    width: 100%; margin-top: 20px; padding: 14px; font: inherit; font-size: 20px; cursor: pointer;
+    background: var(--acc2); color: #000; border: 4px solid #000; box-shadow: 4px 4px 0 #000;
+  }
+  button.go:active { transform: translate(2px,2px); box-shadow: 2px 2px 0 #000; }
+  button.go:disabled { background: #555; color: #999; cursor: default; }
+  .status { margin-top: 12px; min-height: 24px; color: var(--acc); }
+  .status.err { color: #ff8a9e; }
+  .apibox { margin: 12px 0; padding: 10px; border: 1px dashed var(--acc); border-radius: 6px; font-size: 13px; }
+  .apibox input { width: 100%; margin-top: 4px; box-sizing: border-box; }
+  .apistate { margin-top: 6px; font-size: 12px; }
+  .apistate.ok { color: #7ee2a0; }
+  .apistate.ng { color: #ff8a9e; }
+  .verify { margin-top: 8px; padding: 8px 10px; border-radius: 6px; font-size: 13px; line-height: 1.5; }
+  .verify.ok { background: rgba(80, 220, 120, .12); border: 1px solid rgba(80, 220, 120, .5); }
+  .verify.ng { background: rgba(255, 138, 158, .12); border: 1px solid rgba(255, 138, 158, .6); color: #ff8a9e; }
+  .verify details { margin-top: 4px; opacity: .8; }
+  .bar { height: 12px; border: 2px solid #000; background: var(--bg); margin-top: 8px; overflow: hidden; display: none; }
+  .bar i { display: block; height: 100%; width: 40%; background: var(--acc);
+           animation: run 1.1s linear infinite; }
+  @keyframes run { from { transform: translateX(-100%);} to { transform: translateX(250%);} }
+  .result { display: none; }
+  .result audio { width: 100%; margin: 12px 0; }
+  a.dl {
+    display: inline-block; padding: 12px 20px; background: var(--acc); color: #000; text-decoration: none;
+    border: 4px solid #000; box-shadow: 4px 4px 0 #000; font-size: 18px;
+  }
+  .note { color: var(--dim); font-size: 13px; margin-top: 12px; line-height: 1.6; }
+  .badge { display: inline-block; padding: 2px 8px; border: 2px solid #000; font-size: 12px; background: var(--panel2); }
+</style>
+</head>
+<body>
+<main>
+  <h1>♪ 8bit MUSIC CONVERTER</h1>
+  <p class="sub">mp4 (mp3 / wav / m4a も可) か YouTube の URL を入れると、ファミコン風のピコピコな曲にして返します。</p>
+
+  <div class="panel">
+    <div class="drop" id="drop">
+      <p class="big">ここに動画/音声ファイルをドロップ</p>
+      <p style="font-size:13px;color:var(--dim)">(採譜結果の .mid を直して戻すこともできます)</p>
+      <p>またはクリックして選択</p>
+      <p class="file" id="fname"></p>
+      <p><button type="button" class="mini" id="sample">サンプル曲で試す</button></p>
+      <input type="file" id="file" accept="video/*,audio/*,.mp4,.m4a,.mp3,.wav,.mov,.webm,.mid,.midi">
+    </div>
+
+    <div class="or">— または —</div>
+    <div class="urlrow">
+      <input type="url" id="url" placeholder="YouTube の URL を貼り付け  (https://www.youtube.com/watch?v=...)" spellcheck="false">
+    </div>
+
+    <div class="opts">
+      <label class="full">採譜モード
+        <select id="mode">
+          <option value="auto">自動 (使える中で最良のモード)</option>
+          <option value="sep">ボーカル分離 (Demucs・高品質・1〜2 分)</option>
+          <option value="ml">高精度 (basic-pitch・速い)</option>
+          <option value="dsp">軽量 (DSP のみ・最速)</option>
+        </select>
+        <span class="badge" id="mlbadge">…</span>
+      </label>
+      <label>メロディの音色
+        <select id="duty">
+          <option value="0.5">矩形波 50% (太い)</option>
+          <option value="0.25">矩形波 25% (定番)</option>
+          <option value="0.125">矩形波 12.5% (細い)</option>
+        </select>
+      </label>
+      <label>出力形式
+        <select id="fmt">
+          <option value="wav">WAV</option>
+          <option value="mp3">MP3</option>
+          <option value="midi">MIDI (採譜結果)</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="arp" checked> コードのアルペジオ</label>
+      <label>アルペジオ速度
+        <select id="arp_speed">
+          <option value="1">16分音符</option>
+          <option value="2">32分音符 (速い)</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="bass" checked> 三角波ベース</label>
+      <label><input type="checkbox" id="drums" checked> ノイズドラム</label>
+      <label class="full"><input type="checkbox" id="crunch" checked> 8bit 量子化 (ザラつき) を加える</label>
+      <label><input type="checkbox" id="echo"> メロディにエコー</label>
+      <label>メロディのオクターブ
+        <select id="octave">
+          <option value="-1">1 つ下げる</option>
+          <option value="0" selected>そのまま</option>
+          <option value="1">1 つ上げる</option>
+        </select>
+      </label>
+      <details class="full adv">
+        <summary>細かい設定 (ボーカル分離モード)</summary>
+        <div class="opts" style="margin-top:10px">
+          <label class="full">歌の拾いやすさ <input type="range" id="sens" min="0.3" max="0.7" step="0.05" value="0.5"> <span id="sensv">0.50</span></label>
+          <label>テンポ
+            <select id="tempo_mult">
+              <option value="auto">自動判定</option>
+              <option value="1">そのまま</option>
+              <option value="2">倍にする (速い曲)</option>
+            </select>
+          </label>
+          <label><input type="checkbox" id="fill"> 間奏をリード楽器で埋める (実験的)</label>
+          <label><input type="checkbox" id="keysnap" checked> 調に合わない音を補正</label>
+          <label><input type="checkbox" id="quantize" checked> リズムを格子に整える (滑らかに)</label>
+          <label><input type="checkbox" id="trimintro" checked> 歌の無いイントロを省く</label>
+        </div>
+      </details>
+    </div>
+
+    <button class="go" id="go" disabled>▶ 8bit に変換する</button>
+    <div class="apibox" id="apibox" style="display:none">
+      <label>変換サーバーの URL (手元で <code>./run.sh</code> を起動したもの)
+        <input type="url" id="apibase" placeholder="http://localhost:35607"></label>
+      <div class="apistate" id="apistate"></div>
+    </div>
+    <div class="status" id="status"></div>
+    <div class="verify" id="verify" style="display:none"></div>
+    <div class="bar" id="bar"><i></i></div>
+  </div>
+
+  <div class="panel result" id="result">
+    <div>できました！</div>
+    <audio id="player" controls></audio>
+    <a class="dl" id="dl" download>⬇ ダウンロード</a>
+  </div>
+
+  <p class="note">
+    仕組み: 曲からメロディ・ベース・コード・ドラムを聞き取り、ファミコンの 4 チャンネル
+    (矩形波 ×2 / 三角波 / ノイズ) で演奏し直しています。元の音を加工するのではなく「耳コピして打ち込み直す」方式なので、
+    ボーカルが複雑な曲ほどメロディの取りこぼしが出ます。うまくいかないときは音色やモードを変えて試してみてください。
+    ボーカル分離モードは、歌・ドラム・ベース・その他に分けてから各パートを採譜するので主旋律の精度が高く、4 分の曲で 1〜2 分かかります。YouTube の URL を使う場合は 20 分以内の動画に対応しています。
+  </p>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const drop = $("drop"), fileInput = $("file"), go = $("go"), status = $("status"), bar = $("bar");
+let picked = null, lastUrl = null;
+// API サーバーの場所。アプリ本体 (uvicorn) から配信されていれば同一オリジン ("")、
+// GitHub Pages などの静的サイトから開いたときは、手元で動かしているサーバーの URL を使う (既定 http://localhost:35607)
+let API = "";
+if (location.protocol === "file:" || /github\.io$/.test(location.hostname) || !/^(localhost|127\.0\.0\.1)$/.test(location.hostname)) {
+  API = (localStorage.getItem("apiBase") || "http://localhost:35607").replace(/\/+$/, "");
+  $("apibox").style.display = "block";
+  $("apibase").value = API;
+  $("apibase").addEventListener("change", () => {
+    API = $("apibase").value.trim().replace(/\/+$/, "");
+    localStorage.setItem("apiBase", API);
+    checkServer();
+  });
+}
+async function checkServer() {
+  const el = $("apistate");
+  if (!el) return;
+  try {
+    const r = await fetch(`${API}/api/info`);
+    if (!r.ok) throw new Error(r.status);
+    el.textContent = "✓ サーバーに接続できました";
+    el.className = "apistate ok";
+  } catch (_) {
+    el.textContent = "✗ サーバーに接続できません。手元で ./run.sh を起動し、URL を確認してください";
+    el.className = "apistate ng";
+  }
+}
+const urlInput = $("url");
+function refreshButton() { go.disabled = !(picked || urlInput.value.trim()); }
+urlInput.addEventListener("input", () => {
+  if (urlInput.value.trim()) { picked = null; $("fname").textContent = ""; }
+  refreshButton();
+});
+
+$("sens").addEventListener("input", () => { $("sensv").textContent = Number($("sens").value).toFixed(2); });
+if (API) checkServer();
+fetch(`${API}/api/info`).then(r => r.json()).then(i => {
+  const parts = [];
+  parts.push(i.sep_available ? "分離: 利用可" : "分離: 未インストール");
+  parts.push(i.ml_available ? "高精度: 利用可" : "高精度: 未インストール");
+  $("mlbadge").textContent = parts.join(" / ");
+  if (!i.sep_available) $("mode").querySelector('[value="sep"]').disabled = true;
+  if (!i.ml_available) $("mode").querySelector('[value="ml"]').disabled = true;
+}).catch(() => { $("mlbadge").textContent = ""; });
+
+function setFile(f) {
+  if (!f) return;
+  picked = f;
+  urlInput.value = "";
+  $("fname").textContent = `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`;
+  go.disabled = false;
+  status.textContent = "";
+  status.className = "status";
+}
+drop.addEventListener("click", (e) => { if (e.target.id !== "sample") fileInput.click(); });
+$("sample").addEventListener("click", async (e) => {
+  e.stopPropagation();
+  try {
+    const r = await fetch("samples/test_song.mp4");
+    if (!r.ok) throw new Error("サンプルが見つかりません");
+    setFile(new File([await r.blob()], "test_song.mp4", { type: "video/mp4" }));
+  } catch (err) { status.className = "status err"; status.textContent = err.message; }
+});
+fileInput.addEventListener("change", () => setFile(fileInput.files[0]));
+["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));
+["dragleave", "drop"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove("over"); }));
+drop.addEventListener("drop", e => setFile(e.dataTransfer.files[0]));
+
+function showVerify(h) {
+  const box = $("verify");
+  if (!h) { box.style.display = "none"; return; }
+  let v; try { v = JSON.parse(h); } catch (_) { box.style.display = "none"; return; }
+  const pct = (v.rate * 100).toFixed(2), tgt = (v.target * 100).toFixed(1);
+  const hist = (v.history || []).map(x => `${x.iter} 回目: 外れ ${x.n_bad} 音 / 併合 ${x.n_merge} 音`).join("<br>");
+  box.className = "verify " + (v.passed ? "ok" : "ng");
+  box.innerHTML = (v.passed
+    ? `<b>自己検証 OK</b> — 修正を <b>${v.iterations} 回</b> 繰り返し (上限 ${v.max_iter} 回)、外れ ${v.n_bad} 音 (${pct}%、目標 ${tgt}% 以内) / 検証 ${v.n_checked} 音`
+    : `<b>自己検証 NG</b> — <b>${v.iterations} 回</b> 修正しても目標に達しませんでした (上限 ${v.max_iter} 回)。外れ ${v.n_bad} 音 (${pct}%、目標 ${tgt}% 以内) / 検証 ${v.n_checked} 音。<br>この出力にはメロディの誤りが残っている可能性があります。`)
+    + `<details><summary>各回の内訳</summary>${hist}</details>`;
+  box.style.display = "block";
+}
+
+let pollTimer = null;
+async function poll(jobId) {
+  try {
+    const r = await fetch(`${API}/api/jobs/${jobId}`);
+    if (r.ok) {
+      const j = await r.json();
+      if (j.status === "running") status.textContent = j.message;
+    }
+  } catch (_) {}
+}
+
+go.addEventListener("click", async () => {
+  const url = urlInput.value.trim();
+  if (!picked && !url) return;
+  const jobId = crypto.randomUUID ? crypto.randomUUID().replace(/-/g, "") : String(Date.now());
+  const fd = new FormData();
+  if (picked) fd.append("file", picked); else fd.append("url", url);
+  fd.append("mode", $("mode").value);
+  fd.append("duty", $("duty").value);
+  fd.append("fmt", $("fmt").value);
+  fd.append("arpeggio", $("arp").checked);
+  fd.append("arp_speed", $("arp_speed").value);
+  fd.append("bass", $("bass").checked);
+  fd.append("drums", $("drums").checked);
+  fd.append("crunch", $("crunch").checked);
+  fd.append("echo", $("echo").checked);
+  fd.append("melody_octave", $("octave").value);
+  fd.append("sensitivity", $("sens").value);
+  fd.append("tempo_mult", $("tempo_mult").value);
+  fd.append("fill_gaps", $("fill").checked);
+  fd.append("key_snap", $("keysnap").checked);
+  fd.append("quantize", $("quantize").checked);
+  fd.append("trim_intro", $("trimintro").checked);
+  fd.append("job_id", jobId);
+
+  go.disabled = true;
+  $("result").style.display = "none";
+  status.className = "status";
+  status.textContent = picked ? "アップロード中…" : "YouTube からダウンロード中…";
+  bar.style.display = "block";
+  pollTimer = setInterval(() => poll(jobId), 800);
+
+  try {
+    const r = await fetch(`${API}` + (picked ? "/api/convert" : "/api/convert_url"), { method: "POST", body: fd });
+    if (!r.ok) {
+      let msg = `エラー (${r.status})`;
+      try { const j = await r.json(); msg = j.error || j.detail || msg; } catch (_) {}
+      throw new Error(msg);
+    }
+    const blob = await r.blob();
+    const cd = r.headers.get("content-disposition") || "";
+    const m = /filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i.exec(cd);
+    const name = m ? decodeURIComponent(m[1] || m[2]) : `8bit.${$("fmt").value}`;
+    if (lastUrl) URL.revokeObjectURL(lastUrl);
+    lastUrl = URL.createObjectURL(blob);
+    const isMidi = /\.midi?$/i.test(name);
+    $("player").style.display = isMidi ? "none" : "block";
+    $("player").src = isMidi ? "" : lastUrl;
+    $("dl").href = lastUrl;
+    $("dl").download = name;
+    $("dl").textContent = `⬇ ${name} をダウンロード`;
+    $("result").style.display = "block";
+    status.textContent = "完了！";
+    showVerify(r.headers.get("x-verify"));
+  } catch (e) {
+    status.className = "status err";
+    status.textContent = "失敗: " + e.message;
+  } finally {
+    clearInterval(pollTimer);
+    bar.style.display = "none";
+    refreshButton();
+  }
+});
+</script>
+</body>
+</html>

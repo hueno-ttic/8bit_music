@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+*_8bit.wav
+*_8bit.mp3
+.claude/
+_site/
+*.npz
+nohup.out
+.DS_Store
