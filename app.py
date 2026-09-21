@@ -28,10 +28,21 @@ STATIC = ROOT / "static"
 MAX_UPLOAD_MB = 300
 
 app = FastAPI(title="8bit Music Converter")
-# GitHub Pages など別オリジンで配信した UI から、手元のこのサーバーを呼べるようにする
+# GitHub Pages で配信した UI (https://hueno-ttic.github.io/8bit_music/) から、手元のこのサーバーを呼べるようにする。
+# 許可するオリジンは Pages と localhost だけ。サーバー自体は 127.0.0.1 にしか待ち受けない (run.sh)
 from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"],
-                   expose_headers=["X-Verify", "Content-Disposition"])
+ALLOWED_ORIGINS = ["https://hueno-ttic.github.io", "http://localhost:35607", "http://127.0.0.1:35607"]
+app.add_middleware(CORSMiddleware, allow_origins=ALLOWED_ORIGINS, allow_methods=["GET", "POST", "OPTIONS"],
+                   allow_headers=["*"], expose_headers=["X-Verify", "Content-Disposition"])
+
+
+@app.middleware("http")
+async def _private_network_access(request, call_next):
+    """Chrome の Private Network Access: 許可したオリジン (Pages) から localhost への要求に必要なヘッダを付ける."""
+    response = await call_next(request)
+    if request.headers.get("origin") in ALLOWED_ORIGINS:
+        response.headers["Access-Control-Allow-Private-Network"] = "true"
+    return response
 if (ROOT / "samples").is_dir():
     app.mount("/samples", StaticFiles(directory=ROOT / "samples"), name="samples")
 
