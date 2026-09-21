@@ -201,13 +201,18 @@ if (location.protocol === "file:" || /github\.io$/.test(location.hostname) || !/
 async function checkServer() {
   const el = $("apistate");
   if (!el) return;
+  // Chrome は公開サイトから localhost へ接続するとき「ローカルネットワークへのアクセス」の許可を求める。
+  // 許可されるまで fetch は待たされるので、その間は案内を出す
+  el.textContent = "接続中… Chrome が「ローカルネットワークへのアクセス」の許可を求めたら「許可」を押してください";
+  el.className = "apistate";
   try {
     const r = await fetch(`${API}/api/info`);
     if (!r.ok) throw new Error(r.status);
     el.textContent = "✓ サーバーに接続できました";
     el.className = "apistate ok";
   } catch (_) {
-    el.textContent = "✗ サーバーに接続できません。手元で ./run.sh を起動し、URL を確認してください";
+    el.textContent = "✗ サーバーに接続できません。手元で ./run.sh を起動し、URL を確認してください "
+      + "(Chrome でブロックした場合は、アドレスバー左のサイト情報から「ローカルネットワークへのアクセス」を許可して再読み込み)";
     el.className = "apistate ng";
   }
 }

@@ -38,8 +38,10 @@ Pages の UI から使うときは、手元で
 ```
 
 を起動しておき、ページ上部の「変換サーバーの URL」に `http://localhost:35607` (既定) を入れてください。
-接続できると「✓ サーバーに接続できました」と出ます (Chrome / Firefox / Edge は https のページから localhost への接続を許可します。
-Safari で弾かれる場合は http://localhost:35607 を直接開いてください)。
+接続できると「✓ サーバーに接続できました」と出ます。
+Chrome (138 以降) は公開サイトから localhost への接続時に「ローカルネットワークへのアクセス」の許可ダイアログを出すので「許可」を押してください
+(拒否してしまった場合はアドレスバー左のサイト情報から許可し直して再読み込み)。Safari で弾かれる場合は http://localhost:35607 を直接開いてください。
+サーバー側は Pages のオリジン (https://hueno-ttic.github.io) と localhost からの呼び出しだけを受け付けます。
 `main` に push すると `.github/workflows/pages.yml` が `static/` とサンプル曲を Pages に配信します。
 
 ## オプション
