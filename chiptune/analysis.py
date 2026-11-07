@@ -50,6 +50,7 @@ class Score:
     arp_octave: int = 5                                   # アルペジオの基準オクターブ
     key: tuple[int, str] | None = None
     verify: dict | None = None                            # 自己検証レポート (analysis_sep)
+    contour: dict | None = None                           # 歌の音高と音量の動き {hop, midi (無声=nan), level_db} (analysis_sep)
 
 
 # --------------------------------------------------------------------------- utils

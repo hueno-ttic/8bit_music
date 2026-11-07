@@ -17,7 +17,7 @@ def main():
     ap.add_argument("--midi", action="store_true", help="採譜結果を MIDI で出力 (DAW で直して .mid を入力に戻せる)")
     ap.add_argument("--mode", default="auto", choices=["auto", "sep", "ml", "dsp"],
                     help="sep=ボーカル分離 (高品質・遅い), ml=basic-pitch, dsp=軽量, auto=使える中で最良")
-    ap.add_argument("--duty", type=float, default=0.5, choices=[0.125, 0.25, 0.5], help="メロディの矩形波デューティ比")
+    ap.add_argument("--duty", type=float, default=0.25, choices=[0.125, 0.25, 0.5], help="メロディの矩形波デューティ比")
     ap.add_argument("--no-arp", action="store_true", help="コードのアルペジオを鳴らさない")
     ap.add_argument("--arp-speed", type=int, default=1, choices=[1, 2])
     ap.add_argument("--no-drums", action="store_true")
@@ -31,6 +31,11 @@ def main():
     ap.add_argument("--keep-intro", action="store_true", help="歌の無いイントロも省かずに出力する")
     ap.add_argument("--echo", action="store_true", help="メロディにエコーを付ける")
     ap.add_argument("--octave", type=int, default=0, help="メロディのオクターブ移動 (-1, 0, 1)")
+    ap.add_argument("--melody-style", default="crisp", choices=["crisp", "voice", "voice_cont", "follow", "notes"],
+                    help="crisp = 採譜した音符を拍に揃えて 1 音ずつ歯切れ良く (既定), voice = 歌の声から直接 (半音に揃える), voice_cont = 歌の声から直接 (高さは連続), "
+                         "follow = 採譜した音符の高さ + 歌の音量, notes = 採譜した音符で鳴らす")
+    ap.add_argument("--title", help="ファイル入力の曲名。Songle で同じ曲を探し、見つかれば人手修正済みの歌詞タイミングと拍を使う "
+                                    "(曲名は Songle の検索と YouTube に送られる)")
     ap.add_argument("-v", "--verbose", action="store_true")
     a = ap.parse_args()
 
@@ -49,7 +54,7 @@ def main():
                           arp_speed=a.arp_speed, drums=not a.no_drums, bass=not a.no_bass,
                           crunch=not a.no_crunch, fmt="midi" if a.midi else ("mp3" if a.mp3 else "wav"),
                           sensitivity=a.sensitivity, tempo_mult=a.tempo_mult if a.tempo_mult == "auto" else int(a.tempo_mult),
-                          fill_gaps=a.fill, key_snap=not a.no_key_snap, quantize=not a.no_quantize, source_url=source_url, trim_intro=not a.keep_intro, echo=a.echo, melody_octave=a.octave)
+                          fill_gaps=a.fill, key_snap=not a.no_key_snap, quantize=not a.no_quantize, source_url=source_url, song_title=a.title, melody_style=a.melody_style, trim_intro=not a.keep_intro, echo=a.echo, melody_octave=a.octave)
     try:
         out = convert_file(src, dst, opts, progress=print)
     finally:

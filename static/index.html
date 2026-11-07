@@ -90,6 +90,11 @@
       <input type="file" id="file" accept="video/*,audio/*,.mp4,.m4a,.mp3,.wav,.mov,.webm,.mid,.midi">
     </div>
 
+    <div class="urlrow" id="titlerow" style="display:none">
+      <input type="text" id="songtitle" placeholder="曲名と作者名 (任意。例: ヴァンパイア DECO*27)" spellcheck="false">
+      <p style="font-size:12px;color:var(--dim);margin:4px 0 0">曲名を入れると Songle で同じ曲を探し、見つかれば人手修正済みの歌詞タイミングと拍でメロディを区切ります (精度が大きく上がります)。曲名は Songle の検索と YouTube に送られます。</p>
+    </div>
+
     <div class="or">— または —</div>
     <div class="urlrow">
       <input type="url" id="url" placeholder="YouTube の URL を貼り付け  (https://www.youtube.com/watch?v=...)" spellcheck="false">
@@ -105,10 +110,19 @@
         </select>
         <span class="badge" id="mlbadge">…</span>
       </label>
+      <label>メロディの鳴らし方
+        <select id="mstyle">
+          <option value="crisp">音符を拍に揃えて歯切れ良く</option>
+          <option value="voice">歌の声から直接 (半音に揃える)</option>
+          <option value="voice_cont">歌の声から直接 (高さも歌のまま)</option>
+          <option value="follow">採譜した音符の高さ + 歌の抑揚</option>
+          <option value="notes">採譜した音符で鳴らす</option>
+        </select>
+      </label>
       <label>メロディの音色
         <select id="duty">
           <option value="0.5">矩形波 50% (太い)</option>
-          <option value="0.25">矩形波 25% (定番)</option>
+          <option value="0.25" selected>矩形波 25% (定番)</option>
           <option value="0.125">矩形波 12.5% (細い)</option>
         </select>
       </label>
@@ -239,6 +253,9 @@ function setFile(f) {
   picked = f;
   urlInput.value = "";
   $("fname").textContent = `${f.name} (${(f.size / 1048576).toFixed(1)} MB)`;
+  // 曲名の初期値はファイル名 (送る前に利用者が確認・修正できる)
+  $("titlerow").style.display = /\.midi?$/i.test(f.name) ? "none" : "";
+  $("songtitle").value = f.name.replace(/\.[^.]+$/, "").replace(/[_]+/g, " ").replace(/\b(official|mv|music video|full)\b/gi, "").trim();
   go.disabled = false;
   status.textContent = "";
   status.className = "status";
@@ -290,6 +307,7 @@ go.addEventListener("click", async () => {
   if (picked) fd.append("file", picked); else fd.append("url", url);
   fd.append("mode", $("mode").value);
   fd.append("duty", $("duty").value);
+  fd.append("melody_style", $("mstyle").value);
   fd.append("fmt", $("fmt").value);
   fd.append("arpeggio", $("arp").checked);
   fd.append("arp_speed", $("arp_speed").value);
@@ -304,6 +322,7 @@ go.addEventListener("click", async () => {
   fd.append("key_snap", $("keysnap").checked);
   fd.append("quantize", $("quantize").checked);
   fd.append("trim_intro", $("trimintro").checked);
+  if (picked && $("songtitle").value.trim()) fd.append("song_title", $("songtitle").value.trim());
   fd.append("job_id", jobId);
 
   go.disabled = true;

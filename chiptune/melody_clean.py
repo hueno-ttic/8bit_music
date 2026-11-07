@@ -61,7 +61,7 @@ def plateau_pitch(m, v, energy=None, min_len: int = 12):
 
 
 def clean(notes, midi, voiced, scale_pcs: set[int] | None, chord_at=None, *, in_scale_snap: bool = False,
-          landing: bool = False, plateau: bool = False):
+          landing: bool = False, plateau: bool = False, strong_evidence: bool = True):
     """notes: [(start, end, midi, vel)] → 同じ形式. chord_at(t) は構成音 pc の集合か None を返す."""
     notes = [list(n) for n in sorted(notes, key=lambda n: n[0])]
     stats = {"landing": 0, "garbage": 0, "neighbor": 0}
@@ -98,19 +98,38 @@ def clean(notes, midi, voiced, scale_pcs: set[int] | None, chord_at=None, *, in_
         out.append(n)
     notes = out
     # 2b. 音域の外れ音: 前後 3 秒の音域 (長さ重み中央値) から 9 半音以上離れた短い音 (ハモリ・ブレスの残渣)
-    out = []
+    #     ただし外れ音が隙間なく続いて 0.4 秒以上 / 3 音以上になるなら、それは本物のフレーズ
+    #     (デュエットの低いパート、低い節回し) なので残す。1 音ずつ判定すると、細かく区切られたフレーズが丸ごと消える
+    outlier = []
     for i, n in enumerate(notes):
         dur = n[1] - n[0]
+        flag = False
         if dur < 0.3:
             near = [(x[1] - x[0], x[2]) for x in notes if x is not n and x[1] > n[0] - 3.0 and x[0] < n[1] + 3.0]
             if near:
                 w = np.array([d for d, _ in near]); ps = np.array([p for _, p in near])
                 order = np.argsort(ps); c = np.cumsum(w[order]) / w.sum()
                 center = ps[order][int(np.searchsorted(c, 0.5))]
-                if abs(n[2] - center) >= 9:
-                    stats["register"] = stats.get("register", 0) + 1
-                    continue
-        out.append(n)
+                flag = abs(n[2] - center) >= 9
+                if flag and strong_evidence:
+                    # 歌の f0 がその高さでしっかり続いている音は、跳躍やデュエットの別パートなので残す
+                    m_, v_ = _seg(midi, voiced, n[0], n[1])
+                    if v_.size and v_.mean() >= 0.8 and abs(float(np.median(m_[v_])) - n[2]) <= 0.5:
+                        flag = False
+        outlier.append(flag)
+    out = []
+    i = 0
+    while i < len(notes):
+        if not outlier[i]:
+            out.append(notes[i]); i += 1; continue
+        j = i + 1
+        while j < len(notes) and outlier[j] and notes[j][0] - notes[j - 1][1] < 0.15:
+            j += 1
+        if notes[j - 1][1] - notes[i][0] >= 0.4 or j - i >= 3:
+            out.extend(notes[i:j])
+        else:
+            stats["register"] = stats.get("register", 0) + (j - i)
+        i = j
     notes = out
     # 3. 半音の隣
     if in_scale_snap and scale_pcs:

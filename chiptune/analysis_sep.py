@@ -275,6 +275,123 @@ def _round_in_key(p: float, scale: set[int] | None, amb: float = 0.3) -> int:
     return int(np.round(p))
 
 
+F0_THRED = 0.03     # RMVPE の有声判定しきい値
+F0_GATE = 0.04      # 歌ステムの音量がこの割合 (95 パーセンタイル比) 未満のフレームは無声にする
+F0_OCTAVE_FIX = False
+
+
+def fix_octave_jumps(midi: np.ndarray, voiced: np.ndarray, max_len: float = 0.6, ctx: float = 1.5) -> np.ndarray:
+    """f0 のオクターブ飛び (分離の残渣・倍音への誤追従) を直す: 前後と 6 半音以上離れて切れた短い有声区間
+    (max_len 秒未満) が、周囲 ±ctx 秒の音域から 9 半音以上外れ、1 オクターブずらすとずっと近くなるなら、ずらす."""
+    m = midi.copy()
+    n = len(m)
+    hop = 0.01
+    seg_start = None
+    segs = []
+    for i in range(n + 1):
+        brk = i == n or not voiced[i] or (seg_start is not None and abs(m[i] - m[i - 1]) > 6)
+        if brk:
+            if seg_start is not None:
+                segs.append((seg_start, i))
+            seg_start = i if i < n and voiced[i] else None
+        elif seg_start is None:
+            seg_start = i
+    for a, b in segs:
+        if (b - a) * hop >= max_len:
+            continue
+        lo, hi = max(0, a - int(ctx / hop)), min(n, b + int(ctx / hop))
+        sel = voiced[lo:hi].copy()
+        sel[a - lo:b - lo] = False
+        if sel.sum() < 20:
+            continue
+        c = float(np.median(m[lo:hi][sel]))
+        med = float(np.median(m[a:b]))
+        if abs(med - c) < 9:
+            continue
+        for sh in (12, -12):
+            if abs(med + sh - c) < abs(med - c) - 6:
+                m[a:b] += sh
+                break
+    return m
+
+
+TOP_VOICE = True      # 歌ステムに同時に複数の声 (ハモリ) があるとき、一番上の声を主旋律として追う
+TOP_VOICE_MIN = 0.15  # 上の声がこの秒数以上続くときだけ切り替える
+TOP_VOICE_AMP = 0.6   # 上の声の強さが、いま追っている声のこの割合以上のとき
+
+
+def prefer_top_voice(f0: np.ndarray, y: np.ndarray, sr: int, hop: float = 0.01) -> np.ndarray:
+    """f0 (RMVPE: いちばん強い声を追う) が下のハモリを追っている所を、上の声 (主旋律) に置き換える.
+    J-POP / ボカロのハモリは主旋律の下に付けることが多く、サビでは歌ステムに 2 声以上が重なる。RMVPE は強い方の声を
+    追うので、サビで主旋律とハモリの間を行き来し、旋律としてつながらなくなっていた。
+    歌ステムを basic-pitch で多声採譜し、いま追っている声よりオクターブ以外の音程で上に、十分強い声が続いていればそちらにする."""
+    from . import analysis_ml
+    if not analysis_ml.is_available():
+        return f0
+    try:
+        events = analysis_ml._predict_notes(y / (np.abs(y).max() + 1e-9), sr)
+    except Exception as e:  # noqa: BLE001
+        log.warning("多声採譜に失敗したので上の声の選び直しをしません: %s", e)
+        return f0
+    n = len(f0)
+    top = np.full(n, np.nan)       # 各フレームの、追っている声より上の最も高い強い声
+    top_amp = np.zeros(n)
+    cur_amp = np.zeros(n)
+    m = np.where(f0 > 0, librosa.hz_to_midi(np.maximum(f0, 1e-3)), np.nan)
+    for s_, e_, mi, a in events:
+        if not 48 <= mi <= 92:
+            continue
+        a0, a1 = int(s_ / hop), min(n, int(e_ / hop))
+        for k in range(a0, a1):
+            if not np.isfinite(m[k]):
+                continue
+            d = mi - m[k]
+            if abs(d) < 0.7:
+                cur_amp[k] = max(cur_amp[k], a)
+            elif d >= 1.5 and int(round(d)) % 12 != 0 and (not np.isfinite(top[k]) or mi > top[k]):
+                top[k], top_amp[k] = mi, a
+    use = np.isfinite(top) & (top_amp >= TOP_VOICE_AMP * np.maximum(cur_amp, 1e-3))
+    out = f0.copy()
+    k = 0
+    min_len = int(TOP_VOICE_MIN / hop)
+    changed = 0
+    while k < n:
+        if not use[k]:
+            k += 1
+            continue
+        j = k
+        while j < n and use[j]:
+            j += 1
+        if j - k >= min_len:
+            # 上の声の高さ (整数 MIDI) に、元の f0 の細かい揺れ (半音以下) を足す
+            frac = m[k:j] - np.round(m[k:j])
+            out[k:j] = librosa.midi_to_hz(top[k:j] + np.clip(frac, -0.5, 0.5))
+            changed += j - k
+        k = j
+    if changed:
+        log.info("ハモリの下の声を追っていた %.1f 秒を、上の声 (主旋律) に置き換えました", changed * hop)
+    return out
+
+
+def vocal_f0(y: np.ndarray, sr: int):
+    """歌ステムの f0 (Hz, 10 ms, 無声=0)・音量・エネルギー. 楽譜モデルの経路で共通に使う."""
+    from . import notes as N
+    from .pitch import rmvpe_f0
+    t, f0 = rmvpe_f0(y, sr, thred=F0_THRED)
+    if TOP_VOICE:
+        f0 = prefer_top_voice(f0, y, sr)
+    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=int(round(N.HOP_S * sr)))[0]
+    n = min(len(f0), len(rms)); t, f0, rms = t[:n], f0[:n], rms[:n]
+    ref = np.percentile(rms, 95) + 1e-9
+    f0 = np.where(rms >= ref * F0_GATE, f0, 0.0)
+    if F0_OCTAVE_FIX:
+        v = f0 > 0
+        mm = fix_octave_jumps(librosa.hz_to_midi(np.maximum(f0, 1e-3)), v)
+        f0 = np.where(v, librosa.midi_to_hz(mm), 0.0)
+    energy = np.clip(0.5 + 0.5 * rms / ref, 0.4, 1.0)
+    return t, f0, rms, energy
+
+
 def _melody_from_lyrics(y: np.ndarray, sr: int, chars: list[tuple[float, float]], mcells: np.ndarray,
                         key: tuple[int, str] | None = None):
     """歌詞の文字 (モーラ) ごとの発声区間を音符にし、音高は歌ステムの RMVPE f0 で決める.
@@ -288,12 +405,7 @@ def _melody_from_lyrics(y: np.ndarray, sr: int, chars: list[tuple[float, float]]
     from .harmony import scale_pcs
 
     scale = scale_pcs(*key) if key else None
-    t, f0 = rmvpe_f0(y, sr, thred=0.03)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=int(round(N.HOP_S * sr)))[0]
-    n = min(len(f0), len(rms)); t, f0, rms = t[:n], f0[:n], rms[:n]
-    ref = np.percentile(rms, 95) + 1e-9
-    f0 = np.where(rms >= ref * 0.04, f0, 0.0)
-    energy = np.clip(0.5 + 0.5 * rms / ref, 0.4, 1.0)
+    t, f0, rms, energy = vocal_f0(y, sr)
     midi_all = librosa.hz_to_midi(np.maximum(f0, 1e-3))
     valleys = N.syllable_valleys(y, sr, prominence_db=3.0, min_width_ms=20.0)  # 文字内分割の裏付けに使う
     # 短い文字を隣に併合
@@ -389,7 +501,10 @@ def _melody_from_lyrics(y: np.ndarray, sr: int, chars: list[tuple[float, float]]
     return out, seq
 
 
-SM_PARAMS = dict(w_score=3.0, gamma=0.8, on=2.0, inside=-3.0, cross=-6.0, rest_voiced=-5.0, plateau=True)  # マジカルミライ 6 曲 + vocadito で調整
+# マジカルミライ 6 曲 + vocadito で調整。歌詞の文字の頭はそのまま音の頭にする (refine / refine_bnd = False):
+# 楽譜の分かっている評価曲 (tools/eval_synth.py) で音符 F 値 81→85、実曲でも文字の頭は f0 の変わり目と同じくらい拍の格子に揃う
+SM_PARAMS = dict(w_score=3.0, gamma=0.8, on=2.0, inside=-3.0, cross=-6.0, rest_voiced=-5.0, plateau=True,
+                 refine=False, refine_bnd=False)
 
 
 def _melody_from_score_model(y: np.ndarray, sr: int, chars: list[tuple[float, float]], beats: list[dict],
@@ -402,13 +517,49 @@ def _melody_from_score_model(y: np.ndarray, sr: int, chars: list[tuple[float, fl
     from . import notes as N
     from .pitch import rmvpe_f0
 
-    t, f0 = rmvpe_f0(y, sr, thred=0.03)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=int(round(N.HOP_S * sr)))[0]
-    n = min(len(f0), len(rms)); t, f0, rms = t[:n], f0[:n], rms[:n]
-    ref = np.percentile(rms, 95) + 1e-9
-    f0 = np.where(rms >= ref * 0.04, f0, 0.0)
-    energy = np.clip(0.5 + 0.5 * rms / ref, 0.4, 1.0)
+    t, f0, rms, energy = vocal_f0(y, sr)
     out = score_model_notes(t, f0, energy, chars, beats, key, chords=chords, progress=progress)
+    seq = N.seq_from_notes([(a, b, m, v) for a, b, m, v, _ in out], mcells)
+    return out, seq
+
+
+USE_ONSET_MODEL = True      # 歌詞タイミングが無い曲で、検出した音節 + 楽譜モデルを使う (False なら従来の HMM)
+# 検出した音節で楽譜モデルを使うときの SM_PARAMS の上書き (開発 6 曲を交差検証した検出器で調整: tools/eval_8bit.py --folds)
+#   soft_floor: 検出の山が無くても音高が変われば音を始められる下限 / soft_same_floor: 同じ高さの歌い直しには山を要求
+ONSET_SM_PARAMS: dict = {"soft_on": 3.0, "soft_cross": 10.0, "soft_base": 0.02, "soft_floor": 0.06, "soft_same_floor": 0.001,
+                         "refine": True, "refine_bnd": True}   # 検出した音節の頭は不確かなので f0 の変わり目に合わせる
+ONSET_THR: float | None = None  # 音節検出のしきい値 (None ならモデルに付属の値)
+ONSET_SOFT = True               # 検出確率を連続的な事前として使う (False なら山を歌詞の文字と同じ扱いにする)
+
+
+def _beats_from_cells(cells: np.ndarray) -> list[dict]:
+    """16 分セル境界 → Songle 形式の拍 [{start (ms), position 1..4}] (小節の位相は不明なので仮に置く)."""
+    bt = np.asarray(cells[::BEAT_CELLS], dtype=float)
+    if len(bt) > 3:
+        d = np.diff(bt)
+        med = float(np.median(d))
+        # 曲頭に挿入された 0 や曲末の端数など、拍間隔から大きく外れた境界は除く
+        keep = [0] + [i + 1 for i in range(len(d)) if 0.7 * med <= d[i] <= 1.3 * med]
+        if len(bt) > 1 and not (0.7 * med <= d[0] <= 1.3 * med):
+            keep = keep[1:]
+        bt = bt[keep]
+    return [{"start": float(b * 1000.0), "position": int(i % 4) + 1} for i, b in enumerate(bt)]
+
+
+def _melody_from_detected_onsets(y: np.ndarray, sr: int, cells: np.ndarray, mcells: np.ndarray,
+                                 key: tuple[int, str], progress=None):
+    """歌詞タイミングが無い曲: 歌ステムから音節の始まりを検出し (chiptune.onset_model)、
+    それを歌詞の文字境界の代わりにして楽譜モデルで音符列を推定する. 拍節格子はビート検出の結果から作る."""
+    from . import notes as N, onset_model as OM
+    from .pitch import rmvpe_f0
+
+    t, f0, rms, energy = vocal_f0(y, sr)
+    onsets, post = OM.detect(y, sr, t, f0, rms, thr=ONSET_THR)
+    chars = OM.pseudo_chars(onsets, t, f0 > 0)
+    log.info("歌ステムから音節の始まりを %d 個検出し、楽譜モデルの区切りに使います", len(chars))
+    beats = _beats_from_cells(cells)
+    out = score_model_notes(t, f0, energy, chars, beats, key, params=dict(ONSET_SM_PARAMS) or None, progress=progress,
+                            onset_post=post if ONSET_SOFT else None)
     seq = N.seq_from_notes([(a, b, m, v) for a, b, m, v, _ in out], mcells)
     return out, seq
 
@@ -416,10 +567,15 @@ def _melody_from_score_model(y: np.ndarray, sr: int, chars: list[tuple[float, fl
 VERIFY_MAX_ITER = 5
 VERIFY_TARGET = 0.001
 LAST_VERIFY: dict = {}   # 直近の自己検証レポート (analyze_sep が Score に載せる)
+LAST_SYLLABLES: list = []  # 直近の楽譜モデルで使った音節の頭 [秒] (歌詞の文字, または検出した音節)
+LAST_SYLLABLE_SPANS: list = []  # 同じく音節の区間 [(開始, 終了)]
 
 
-def score_model_notes(t, f0, energy, chars, beats, key, chords=None, params: dict | None = None, progress=None):
-    """f0 (Hz, 10 ms, 0=無声) から音符列 [(start, end, midi, vel, legato)] を作る (楽譜モデル経路の本体)."""
+def score_model_notes(t, f0, energy, chars, beats, key, chords=None, params: dict | None = None, progress=None,
+                      onset_post: np.ndarray | None = None):
+    """f0 (Hz, 10 ms, 0=無声) から音符列 [(start, end, midi, vel, legato)] を作る (楽譜モデル経路の本体).
+    onset_post: 歌詞の代わりに音節検出器の確率 (10 ms ごと) を使う場合に渡す。chars は検出した山から作った仮の文字区間で、
+    格子を寄せるのに使い、音の始まり/またぎの事前は確率から連続的に作る (取りこぼし・誤検出に強い)."""
     from . import notes as N, score_model as SM, melody_clean as MC
     from .harmony import scale_pcs as _spcs
 
@@ -428,15 +584,32 @@ def score_model_notes(t, f0, energy, chars, beats, key, chords=None, params: dic
     chars = SM.merge_short_chars(chars)
     if p_refine := (params or {}).get("refine", SM_PARAMS.get("refine", True)):
         chars = SM.refine_onsets(chars, t, midi_all, voiced)
+    LAST_SYLLABLES[:] = [float(c[0]) for c in chars]   # 音節の頭 (8bit で言い直す所: synth.follow_frames)
+    LAST_SYLLABLE_SPANS[:] = [(float(a), float(b)) for a, b in chars]
     cells16, cpos = SM.cells_from_beats(beats, float(t[-1]) + 0.1)
     lattice = SM.warp_lattice(SM.make_lattice(cells16, MEL_DIV), [c[0] for c in chars])
     beat_pos = (np.repeat(cpos, MEL_DIV) * MEL_DIV + np.tile(np.arange(MEL_DIV), len(cpos)))[: len(lattice) - 1]
     p = dict(SM_PARAMS); p.update(params or {})
     landing = bool(p.pop("landing", False)); plateau = bool(p.pop("plateau", False)); p.pop("refine", None)
-    onset_lp, cross_lp = SM.lyric_priors(lattice, chars, p.pop("on"), p.pop("inside"), p.pop("cross"))
+    p_defrag = bool(p.pop("defrag", False))   # 細切れの音をまとめる (検出した音節を使うときは常に行う)
+    p_refine_bnd = bool(p.pop("refine_bnd", True))   # 音高が変わる境界を f0 の変わり目に合わせる
+    p_merge_same = bool(p.pop("merge_same", True))
+    on_w, inside_w, cross_w = p.pop("on"), p.pop("inside"), p.pop("cross")
+    soft_on, soft_cross, soft_base = p.pop("soft_on", 1.0), p.pop("soft_cross", 3.0), p.pop("soft_base", 0.15)
+    soft_floor, soft_same_floor = p.pop("soft_floor", 1e-3), p.pop("soft_same_floor", None)
+    if onset_post is not None:
+        pri = SM.soft_onset_priors(lattice, onset_post, soft_on, soft_cross, soft_base, soft_floor, soft_same_floor)
+        onset_lp, cross_lp = pri[0], pri[1]
+        if len(pri) > 2:
+            p["same_prior"] = pri[2]
+    else:
+        onset_lp, cross_lp = SM.lyric_priors(lattice, chars, on_w, inside_w, cross_w)
     est = SM.estimate_notes(t, midi_all, voiced, lattice, tonic=key[0], mode=key[1], div=MEL_DIV,
                             onset_prior=onset_lp, beat_pos=beat_pos, cross_prior=cross_lp, **p)
-    est = SM.merge_same_pitch(est, [c[0] for c in chars])
+    if p_merge_same:
+        # 同じ高さで根拠なく割れた音をつなぐ (歌詞の文字境界を根拠にする)。検出器の確率で区切った場合は、
+        # 楽譜モデルがすでに確率を見て歌い直しかどうかを決めているので行わない (行うと歌い直しの 1〜2 割が消えた)
+        est = SM.merge_same_pitch(est, [c[0] for c in chars])
     raw = []
     for s_, e_, m in est:
         a, b = int(s_ / N.HOP_S), max(int(e_ / N.HOP_S), int(s_ / N.HOP_S) + 1)
@@ -455,11 +628,165 @@ def score_model_notes(t, f0, energy, chars, beats, key, chords=None, params: dic
     log.info("後処理: %s", cstats)
     phrases = N.phrases_from_voicing(t, voiced)
     out = SM.link_phrases(raw, t, midi_all, voiced, phrases)
+    if onset_post is not None or p_defrag:
+        out = N.defragment(out)
+    if p_refine_bnd:
+        out = N.refine_boundaries(out, midi_all, voiced)
     # 自己検証と修正の繰り返し (外れ <= 0.1% になるまで、上限 5 回)。実際に鳴らす音符列 (接続後) を検証する
     from . import verify as V
-    out, report = V.verify_loop(out, midi_all, voiced, max_iter=VERIFY_MAX_ITER, target=VERIFY_TARGET, progress=progress, log=log)
+    out, report = V.verify_loop(out, midi_all, voiced, max_iter=VERIFY_MAX_ITER, target=VERIFY_TARGET, progress=progress, log=log,
+                                onsets=[c[0] for c in chars])
     LAST_VERIFY.clear(); LAST_VERIFY.update(report)
+    # 修正 (取りこぼしの補い等) で残った細切れを整理する (歌詞タイミングの経路も同じ)。
+    # 検証で入れた短い音 (歌が留まった音) は消さないよう、ここでは同じ高さの断片と 50 ms 未満の切れ端だけ
+    out = N.defragment(out, min_len=0.05)
     return out
+
+
+SUNG_SEG_MIN = 0.04   # 歌がこの秒数以上はっきり留まった高さは、すべて音符にする
+INSERT_SUNG_SEGMENTS = False
+MELODY_METHOD = "syllable"   # "syllable" = 音節ごとに 1 音 / "model" = 楽譜モデルの音符
+
+
+def insert_sung_segments(melody: list, contour_midi: np.ndarray, hop: float = 0.01, min_len: float = SUNG_SEG_MIN) -> list:
+    """楽譜モデルの音符 (骨組み) に、歌がはっきり留まったのに鳴っていない高さを音符として差し込む.
+    ボカロは 1 音節に 2 つ以上の音 (こぶし・速い経過音) を打ち込むことが多いが、文字単位の楽譜モデルと細切れ対策で
+    それが消え、本物の曲で「歌が 50 ms 以上留まった高さ」の 13〜20% が鳴っておらず、聴くと間の音が抜けて別の曲に聞こえた."""
+    from scipy.ndimage import median_filter
+    from .analysis import Note
+    m = np.asarray(contour_midi, dtype=float)
+    ok = np.isfinite(m)
+    sm = np.where(ok, median_filter(np.nan_to_num(m), 5), np.nan)
+    q = np.where(ok & (np.abs(sm - np.round(sm)) <= 0.4), np.round(sm), np.nan)
+    n = len(q)
+    owner = np.full(n, -1)
+    notes = sorted(melody, key=lambda x: x.start)
+    for i, nt in enumerate(notes):
+        owner[max(0, int(round(nt.start / hop))):min(n, int(round(nt.end / hop)))] = i
+    cuts: dict[int, list] = {}
+    i = 0
+    L = max(2, int(round(min_len / hop)))
+    while i < n:
+        if not np.isfinite(q[i]):
+            i += 1
+            continue
+        j = i
+        while j < n and q[j] == q[i]:
+            j += 1
+        if j - i >= L:
+            own = owner[i:j]
+            k = int(np.bincount(own[own >= 0]).argmax()) if np.any(own >= 0) else -1
+            if k >= 0 and notes[k].midi != int(q[i]) and np.mean(own == k) >= 0.6:
+                cuts.setdefault(k, []).append((i * hop, j * hop, int(q[i])))
+        i = j
+    out = []
+    for i, nt in enumerate(notes):
+        if i not in cuts:
+            out.append(nt)
+            continue
+        cur = nt.start
+        for a, b, p in sorted(cuts[i]):
+            a, b = max(a, nt.start), min(b, nt.end)
+            if a - cur >= min_len:
+                out.append(Note(cur, a, nt.midi, nt.velocity, True))
+            elif out and a > cur and out[-1].end == cur:
+                pass
+            out.append(Note(max(cur, a) if a - cur >= min_len else cur, b, p, nt.velocity, True))
+            cur = b
+        if nt.end - cur >= min_len:
+            out.append(Note(cur, nt.end, nt.midi, nt.velocity, nt.legato))
+        elif out:
+            out[-1] = Note(out[-1].start, nt.end, out[-1].midi, out[-1].velocity, nt.legato)
+    log.info("歌がはっきり留まったのに鳴っていなかった高さ %d 個を音符にしました", sum(len(v) for v in cuts.values()))
+    return out
+
+
+SYL_MELISMA_MIN = 0.12   # 音節の中で 2 つ目の高さにこれ以上はっきり留まったら音を分ける
+SYL_TAIL_MAX = 0.6       # フレーズの終わりの音を、歌の声が続く限り最大この秒数まで伸ばす
+
+
+def syllable_notes(chars, midi_contour: np.ndarray, voiced: np.ndarray, level_db: np.ndarray | None = None,
+                   hop: float = 0.01) -> list:
+    """歌詞の音節ごとに 1 音を作る (ボカロの譜面は基本 1 音節 = 1 音符で打ち込まれる).
+    - 音は音節の頭から次の音節の頭まで (間が空けば、歌の声が続く所まで)。歌詞の無い所には音を置かない
+    - 高さは音節の後ろ 7 割の、歌が安定している所に重みを置いた中央値 (しゃくりを除く。知覚される音高は安定部に寄る)
+    - 音節の中で 2 つ目の高さに SYL_MELISMA_MIN 秒以上はっきり留まる (こぶし・メリスマ) ときだけ音を分ける
+    これまでの方式は文字の中の揺れまで音符にしたり、文字単位の事前で音を消したりして、聴くと「余計な音」「抜けた音」になった."""
+    from scipy.ndimage import median_filter
+    from .analysis import Note
+    m = np.asarray(midi_contour, dtype=float)
+    v = np.asarray(voiced, bool) & np.isfinite(m)
+    n = len(m)
+    sm = np.where(v, median_filter(np.nan_to_num(m), 5), np.nan)
+    stab = np.zeros(n)
+    d = np.abs(np.diff(np.nan_to_num(sm), prepend=0.0))
+    stab[v] = 1.0 / (1.0 + (d[v] / 0.15) ** 2)
+    out = []
+    prev_pitch = None
+    for i, (cs, ce) in enumerate(chars):
+        nxt = chars[i + 1][0] if i + 1 < len(chars) else None
+        a, b = int(round(cs / hop)), min(n, int(round(ce / hop)))
+        if b - a < 3:
+            continue
+        # 終わり: 次の音節が近ければそこまで、離れていれば歌の声が続く所まで
+        if nxt is not None and nxt - ce < 0.25:
+            end = nxt
+        else:
+            k = b
+            lim = min(n, b + int(SYL_TAIL_MAX / hop), int(round(nxt / hop)) if nxt is not None else n)
+            while k < lim and (v[k] or (k + 1 < lim and v[k + 1])):
+                k += 1
+            end = max(ce, k * hop)
+        e = min(n, int(round(end / hop)))
+        core = np.arange(a + int(0.3 * (b - a)), max(b, a + int(0.3 * (b - a)) + 1))
+        core = core[(core < n) & v[np.clip(core, 0, n - 1)]]
+        if len(core) < 2:
+            seg = np.arange(a, e)
+            core = seg[(seg < n) & v[np.clip(seg, 0, n - 1)]]
+        if len(core) < 2:
+            if prev_pitch is not None and out and cs - out[-1].end < 0.2 and level_db is not None \
+                    and np.max(level_db[a:max(a + 1, b)]) > -25:
+                out.append(Note(cs, end, prev_pitch, 1.0, True))   # 音程の取れない文字 (子音主体): 同じ高さで歌い直す
+            continue
+        w = stab[core] + 1e-3
+        vals = sm[core]
+        order = np.argsort(vals)
+        cw = np.cumsum(w[order]) / w.sum()
+        pitch = int(np.round(vals[order][int(np.searchsorted(cw, 0.5))]))
+        # メリスマ: 音節の中に別の高さの安定区間 (SYL_MELISMA_MIN 以上) があれば分ける
+        q = np.where(np.isfinite(sm[a:e]) & (np.abs(sm[a:e] - np.round(sm[a:e])) <= 0.4), np.round(sm[a:e]), np.nan)
+        segs = []
+        j = 0
+        while j < len(q):
+            if not np.isfinite(q[j]):
+                j += 1
+                continue
+            k = j
+            while k < len(q) and q[k] == q[j]:
+                k += 1
+            if (k - j) * hop >= SYL_MELISMA_MIN:
+                segs.append([a + j, a + k, int(q[j])])
+            j = k
+        merged = []
+        for sg in segs:
+            if merged and merged[-1][2] == sg[2]:
+                merged[-1][1] = sg[1]
+            else:
+                merged.append(sg)
+        if len(merged) >= 2:
+            bounds = [cs] + [merged[k][0] * hop for k in range(1, len(merged))] + [end]
+            for k, sg in enumerate(merged):
+                out.append(Note(float(bounds[k]), float(bounds[k + 1]), sg[2], 1.0, k + 1 < len(merged)))
+            prev_pitch = merged[-1][2]
+        else:
+            out.append(Note(float(cs), float(end), pitch, 1.0, False))
+            prev_pitch = pitch
+    # 重なりの解消
+    out.sort(key=lambda x: x.start)
+    for k in range(len(out) - 1):
+        if out[k].end > out[k + 1].start:
+            out[k] = Note(out[k].start, out[k + 1].start, out[k].midi, out[k].velocity, out[k].legato)
+    return [x for x in out if x.end - x.start >= 0.03]
 
 
 def _cells_to_notes_split(seq, cells, vel, split):
@@ -599,10 +926,13 @@ def _lead_from_other(oth: np.ndarray, sr: int, cells: np.ndarray):
 def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.ndarray] | None = None, *,
                 sensitivity: float = 0.5, tempo_mult: str | int = "auto", fill_gaps: bool = False,
                 key_snap: bool = True, use_crepe: bool = True, melody_method: str = "hmm",
-                quantize: bool = True, source_url: str | None = None) -> Score:
-    """sensitivity: 歌の拾いやすさ 0.3〜0.7. tempo_mult: "auto" | 1 | 2. fill_gaps: 間奏をリード楽器で埋めるか."""
+                quantize: bool = True, source_url: str | None = None, songle_offset: float = 0.0) -> Score:
+    """sensitivity: 歌の拾いやすさ 0.3〜0.7. tempo_mult: "auto" | 1 | 2. fill_gaps: 間奏をリード楽器で埋めるか.
+    source_url: Songle の拍・歌詞タイミング・コードを使う元の動画. songle_offset: 手元の音声が元の動画より何秒遅れているか."""
     duration = len(y) / sr
     y = y / (np.abs(y).max() + 1e-9)
+    LAST_SYLLABLES.clear()
+    LAST_SYLLABLE_SPANS.clear()
 
     if stems is None:
         stems = separate(y, sr, progress=progress)
@@ -613,7 +943,7 @@ def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.
     sg_beats = None
     if source_url:
         from . import songle as SG
-        sg_beats = SG.beats(source_url)
+        sg_beats = SG.beats(source_url, songle_offset)
     if sg_beats and len(sg_beats) > 8:
         # Songle の拍 (人手修正済み) をそのまま 16 分格子にする。メロディの格子と完全に一致させる
         from . import score_model as SM
@@ -636,23 +966,30 @@ def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.
     lyric_chars = None
     if source_url:
         from . import songle as SG
-        lyric_chars = SG.lyrics_chars(source_url)
+        lyric_chars = SG.lyrics_chars(source_url, songle_offset)
         if lyric_chars:
             log.info("Songle/TextAlive の歌詞タイミング %d 文字を音符の区切りに使います", len(lyric_chars))
 
     def _lyric_melody(mc):
         if sg_beats and len(sg_beats) > 8:
             log.info("楽譜モデル (調・リズム・歌詞の事前 + Cauchy F0 モデル) でメロディを推定します")
-            _sgc = SG.chords(source_url) or []
+            _sgc = SG.chords(source_url, songle_offset) or []
             _parsed = [(c["start"] / 1000.0, (c["start"] + c["duration"]) / 1000.0, SG.parse_chord(c.get("name"))) for c in _sgc]
             return _melody_from_score_model(voc, sr, lyric_chars, sg_beats, mc, key=_key, chords=_parsed, progress=progress)
         return _melody_from_lyrics(voc, sr, lyric_chars, mc, key=_key)
 
-    if lyric_chars:
+    from . import onset_model as _OM
+    use_onsets = not lyric_chars and melody_method == "hmm" and USE_ONSET_MODEL and _OM.is_available()
+    if lyric_chars or use_onsets:
         from .harmony import estimate_key as _ek
         _chroma = librosa.feature.chroma_cqt(y=oth + voc, sr=sr, hop_length=HOP, n_chroma=12)
         _key = _ek(_chroma.mean(axis=1))
+    if lyric_chars:
         hmm_notes, voc_seq = _lyric_melody(mcells)
+        voc_vel = [1.0] * len(voc_seq)
+        voc_split = [False] * len(voc_seq)
+    elif use_onsets:
+        hmm_notes, voc_seq = _melody_from_detected_onsets(voc, sr, cells, mcells, _key, progress=progress)
         voc_vel = [1.0] * len(voc_seq)
         voc_split = [False] * len(voc_seq)
     elif melody_method == "hmm":
@@ -672,6 +1009,10 @@ def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.
         n_cells = len(cells) - 1
         if lyric_chars:
             hmm_notes, voc_seq = _lyric_melody(mcells)
+            voc_vel = [1.0] * len(voc_seq)
+            voc_split = [False] * len(voc_seq)
+        elif use_onsets:
+            hmm_notes, voc_seq = _melody_from_detected_onsets(voc, sr, cells, mcells, _key, progress=progress)
             voc_vel = [1.0] * len(voc_seq)
             voc_split = [False] * len(voc_seq)
         elif melody_method == "hmm":
@@ -721,7 +1062,7 @@ def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.
             mel_seq, mel_vel = voc_seq, voc_vel
     if hmm_notes is not None and not (vocal_cov < 0.15 or voc_level / oth_level < 0.25):
         raw_notes = hmm_notes
-        if key_snap and not lyric_chars:
+        if key_snap and not lyric_chars and not use_onsets:  # 楽譜モデルは調の事前を持つので後から寄せない
             snapped = _snap_to_key([m for _, _, m, _, _ in raw_notes], tonic, mode, max_len=1)
             raw_notes = [(s_, e_, m2, v_, l_) for (s_, e_, _, v_, l_), m2 in zip(raw_notes, snapped)]
         melody = [A.Note(s_, e_, m_, v_, l_) for s_, e_, m_, v_, l_ in raw_notes]
@@ -808,7 +1149,7 @@ def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.
     chords_by_beat = H.estimate_chords(beat_chroma, bass_pc, tonic, mode, beat_in_bar=beat_in_bar, min_energy=has_energy)
     if source_url:
         from . import songle as SG
-        sg_chords = SG.chords(source_url)
+        sg_chords = SG.chords(source_url, songle_offset)
         if sg_chords:
             parsed = [(c["start"] / 1000.0, (c["start"] + c["duration"]) / 1000.0, SG.parse_chord(c.get("name"))) for c in sg_chords]
             used = 0
@@ -838,11 +1179,28 @@ def analyze_sep(y: np.ndarray, sr: int = SR, progress=None, stems: dict[str, np.
     drums = R.render_hits(pats, bar_starts, cells, act, intensity)
     log.info("ドラムパターン: %s", {k: pats.count(k) for k in set(pats)})
 
+    # 歌の音高と音量の動き: メロディを「歌に沿わせて」鳴らすのに使う (synth.render_follow_melody)
+    contour = None
+    if hmm_notes is not None and not (vocal_cov < 0.15 or voc_level / oth_level < 0.25):
+        _, c_f0, c_rms, _ = vocal_f0(voc, sr)
+        c_midi = np.where(c_f0 > 0, librosa.hz_to_midi(np.maximum(c_f0, 1e-3)), np.nan)
+        c_lv = 20 * np.log10(c_rms / (np.percentile(c_rms, 95) + 1e-9) + 1e-6)
+        if MELODY_METHOD == "syllable" and LAST_SYLLABLE_SPANS:
+            # 音節ごとに 1 音 (歌詞の文字, 無ければ検出した音節)
+            melody = syllable_notes(LAST_SYLLABLE_SPANS, c_midi, c_f0 > 0, c_lv)
+            log.info("メロディ: 音節ごとに 1 音で %d 音 (音節 %d)", len(melody), len(LAST_SYLLABLE_SPANS))
+        elif INSERT_SUNG_SEGMENTS:
+            melody = insert_sung_segments(melody, c_midi)
+        c_ref = np.percentile(c_rms, 95) + 1e-9
+        contour = dict(hop=0.01, midi=np.where(c_f0 > 0, librosa.hz_to_midi(np.maximum(c_f0, 1e-3)), np.nan).astype(np.float32),
+                       level_db=(20 * np.log10(c_rms / c_ref + 1e-6)).astype(np.float32),
+                       syllables=np.asarray(LAST_SYLLABLES, dtype=np.float64))
+
     return Score(duration=duration, tempo=tempo, cells=cells,
                  melody=melody, bass=bass, chords=chords, drums=drums,
                  bar_starts=list(map(int, bar_starts)), intensity=[float(v) for v in intensity],
                  arp_octave=AR.arpeggio_octave(melody), key=(int(tonic), mode),
-                 verify=dict(LAST_VERIFY) if LAST_VERIFY else None)
+                 verify=dict(LAST_VERIFY) if LAST_VERIFY else None, contour=contour)
 
 
 def _gap_spans(seq: list[int | None]):

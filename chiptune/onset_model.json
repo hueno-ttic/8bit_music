@@ -1,0 +1,34 @@
+{
+ "ch": 32,
+ "gru": 0,
+ "thr": 0.3,
+ "val_f": 0.6036,
+ "train": [
+  "greenlights",
+  "aisarenakutemo",
+  "sand_planet",
+  "39music",
+  "hand_in_hand",
+  "bless_mv",
+  "hibana",
+  "ghost_rule",
+  "aikotoba3",
+  "unknown_mothergoose",
+  "inochi",
+  "karakuri",
+  "donut_hole",
+  "kamippoina",
+  "phony",
+  "king",
+  "rettou",
+  "tell_your_world",
+  "melty",
+  "shanti",
+  "happy_synth"
+ ],
+ "val": [
+  "teo",
+  "lower"
+ ],
+ "excluded": []
+}

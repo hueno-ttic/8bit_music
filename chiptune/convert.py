@@ -19,7 +19,7 @@ log = logging.getLogger(__name__)
 @dataclass
 class ConvertOptions:
     mode: str = "auto"          # "auto" | "sep" | "ml" | "dsp"
-    melody_duty: float = 0.5    # 0.125 / 0.25 / 0.5
+    melody_duty: float = 0.25   # 0.125 / 0.25 / 0.5 (25% がファミコンのリードの定番)
     arpeggio: bool = True
     arp_speed: int = 1          # 1 = 16分, 2 = 32分
     drums: bool = True
@@ -33,10 +33,13 @@ class ConvertOptions:
     key_snap: bool = True       # 調に合わない短い音を寄せる
     quantize: bool = True       # メロディを格子に量子化して滑らかに (楽譜らしく)
     source_url: str | None = None  # 元の YouTube URL (Songle / TextAlive の歌詞タイミング等に使う)
+    song_title: str | None = None  # ファイル入力の曲名: Songle で同じ曲を探し、見つかれば歌詞タイミングと拍を使う
+    songle_offset: float = 0.0     # 手元の音声が元の動画より何秒遅れているか (song_title から求める)
     trim_intro: bool = True     # 歌の無い長いイントロは出力から省く
     # --- 演奏
     echo: bool = False          # メロディのエコー (歌の細かい動きが二重に聞こえるので既定 OFF)
     melody_octave: int = 0      # メロディのオクターブ移動
+    melody_style: str = "crisp"   # "crisp" = 音符を拍に揃えて歯切れ良く / "voice" / "voice_cont" / "follow" / "notes" (synth.render)
 
 
 def _pick_mode(mode: str) -> str:
@@ -97,9 +100,18 @@ def convert_file(src: str | Path, dst: str | Path, opts: ConvertOptions | None =
         pass
     elif mode == "sep":
         from .analysis_sep import analyze_sep
+        if opts.song_title and not opts.source_url:
+            from . import songle_match
+            try:
+                m = songle_match.find(y, SR, opts.song_title, progress=report)
+            except Exception as e:  # noqa: BLE001  (照合に失敗してもファイルだけで続ける)
+                log.warning("Songle との照合に失敗しました: %s", e)
+                m = None
+            if m is not None:
+                opts.source_url, opts.songle_offset = m.url, m.offset
         score = analyze_sep(y, SR, progress=report, sensitivity=opts.sensitivity, tempo_mult=opts.tempo_mult,
                             fill_gaps=opts.fill_gaps, key_snap=opts.key_snap, quantize=opts.quantize,
-                            source_url=opts.source_url)
+                            source_url=opts.source_url, songle_offset=opts.songle_offset)
     elif mode == "ml":
         from .analysis_ml import analyze_ml
         score = analyze_ml(y, SR)
@@ -129,7 +141,7 @@ def convert_file(src: str | Path, dst: str | Path, opts: ConvertOptions | None =
             report(f"歌の無いイントロ {trim_start:.1f} 秒を省きます")
     out = render(score, OUT_SR, melody_duty=opts.melody_duty, arpeggio=opts.arpeggio,
                  drums=opts.drums, bass=opts.bass, arp_speed=opts.arp_speed, crunch=opts.crunch,
-                 echo=opts.echo, melody_octave=opts.melody_octave)
+                 echo=opts.echo, melody_octave=opts.melody_octave, melody_style=opts.melody_style)
 
     if trim_start > 0:
         k = int(trim_start * OUT_SR)

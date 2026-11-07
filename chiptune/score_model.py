@@ -28,7 +28,11 @@ def make_lattice(cells16: np.ndarray, div: int = 2) -> np.ndarray:
 def cells_from_beats(beats: list[dict], duration: float) -> tuple[np.ndarray, np.ndarray]:
     """Songle の拍 (start ms, position 1..4) から 16 分セル境界と各セルの小節内位置 (0..15) を作る."""
     bt = np.array([b["start"] / 1000.0 for b in beats]); pos = np.array([b["position"] for b in beats])
-    d0 = bt[1] - bt[0]
+    # 拍間隔が 0 以下だと外挿が終わらない (Songle の拍は前後することがある: songle.sanitize_beats で直す) ので、
+    # 曲頭・曲末の外挿には正の拍間隔 (中央値) を使う
+    dpos = np.diff(bt)[np.diff(bt) > 0]
+    med = float(np.median(dpos)) if len(dpos) else 0.5
+    d0 = bt[1] - bt[0] if bt[1] - bt[0] > 0.3 * med else med
     k = 1
     while bt[0] - k * d0 > 0:
         k += 1
@@ -40,6 +44,8 @@ def cells_from_beats(beats: list[dict], duration: float) -> tuple[np.ndarray, np
         for q in range(4):
             cells.append(allb[i] + (allb[i + 1] - allb[i]) * q / 4); cpos.append(((allp[i] - 1) % 4) * 4 + q)
     d = allb[-1] - allb[-2]
+    if d <= 0.3 * med:
+        d = med
     tcur = allb[-1]; p = allp[-1]
     while tcur < duration:
         for q in range(4):
@@ -98,6 +104,7 @@ def estimate_notes(t: np.ndarray, f0_midi: np.ndarray, voiced: np.ndarray, latti
                    gamma: float = 0.6, w_score: float = 2.5, w_f0: float = 1.0, max_len_tatum: int = 16,
                    rest_logp: float = -0.3, trans_frames: int = 4, note_cost: float = -1.0,
                    cross_prior: np.ndarray | None = None, in_key_w: float = 10.0,
+                   same_prior: np.ndarray | None = None,
                    chord_pcs: list | None = None, w_chord: float = 0.0, octave_w: float = 0.0,
                    rest_voiced: float = -3.0):
     """f0 (MIDI 単位, 10 ms) と格子から音符列 [(start, end, midi)] を推定する.
@@ -105,6 +112,7 @@ def estimate_notes(t: np.ndarray, f0_midi: np.ndarray, voiced: np.ndarray, latti
     onset_prior: 格子点ごとの「ここで音が始まる」対数事前 (歌詞の文字境界などから)。None なら一様。
     beat_pos   : 格子点ごとの拍節位置 (0=拍頭, 1=16分裏 ...) があればリズム事前に使う。
     cross_prior: 格子点ごとの「音がここをまたいで続く」対数事前 (歌詞の文字境界では負にして、音を区切り直させる)。
+    same_prior : 格子点ごとの「同じ高さの音をここで歌い直す」追加の対数事前 (音高が変わらない区切りには発音の証拠を要求する)。
     chord_pcs  : 格子点ごとのコード構成音 (pitch class の集合、無ければ None)。w_chord > 0 なら構成音の音を優遇する。
     """
     scale_pcs = {(tonic + d) % 12 for d in (MAJOR if mode == "major" else MINOR)}
@@ -201,6 +209,8 @@ def estimate_notes(t: np.ndarray, f0_midi: np.ndarray, voiced: np.ndarray, latti
             prev = best[s]
             if prev.max() > NEG / 2:
                 cand = prev[:, None] + trans * w_score + T_trans[c, s] * w_f0    # [K_prev, K]
+                if same_prior is not None:
+                    cand[np.arange(K), np.arange(K)] += same_prior[s] * w_score
                 q_best = np.argmax(cand, axis=0); from_note = cand[q_best, np.arange(K)]
             else:
                 from_note = np.full(K, NEG); q_best = np.full(K, -1)
@@ -250,6 +260,37 @@ def lyric_priors(lattice: np.ndarray, chars, on: float = 2.0, inside: float = -3
         if abs(lattice[i] - s_) <= lim:
             cr[i] = cross
     return lp, cr
+
+
+def _peak_height(post: np.ndarray) -> np.ndarray:
+    """検出器の確率から前後 1 秒の中央値 (底上げ分) を引いた山の高さ."""
+    from scipy.ndimage import median_filter
+    post = np.asarray(post, dtype=float)
+    return np.clip(post - median_filter(post, size=101, mode="nearest"), 0.0, 1.0)
+
+
+def soft_onset_priors(lattice: np.ndarray, post: np.ndarray, on: float = 1.0, cross: float = 3.0, base: float = 0.15,
+                      floor: float = 1e-3, same_floor: float | None = None):
+    """音節検出器の確率 post (10 ms ごと) → (格子点ごとの音の始まりの事前, またぎ越しの事前).
+    確率から前後 1 秒の中央値 (底上げ分) を引いた「山の高さ」について、格子点の近く (±半セル) の最大値 q を使い、始まり: on * log(q / base) (q が base より高ければ優遇)、
+    またぎ: -cross * q (音節の始まりらしい所を 1 音で素通りするのを嫌う)。"""
+    # 検出器の確率の底上げ (曲・区間によって 0.2 前後に張り付くことがある) を除き、山の高さだけを使う
+    post = _peak_height(post)
+    n = len(post)
+    half = max(1, int(round(0.5 * float(np.median(np.diff(lattice))) / HOP_S)))
+    q = np.zeros(len(lattice))
+    for i, x in enumerate(lattice):
+        c = int(round(x / HOP_S))
+        a, b = max(0, c - min(half, 3)), min(n, c + min(half, 3) + 1)
+        q[i] = post[a:b].max() if b > a else 0.0
+    lp = on * np.log(np.clip(q[:-1], floor, 1.0) / base)   # floor: 検出の無い所でも音を始められる下限
+    cr = np.zeros(len(lattice) + 1)
+    cr[:len(lattice)] = -cross * q
+    if same_floor is None:
+        return lp, cr
+    # 同じ高さの歌い直しは、検出の山が無ければ (floor より厳しい same_floor まで) 不利にする
+    same = on * (np.log(np.clip(q[:-1], same_floor, 1.0)) - np.log(np.clip(q[:-1], floor, 1.0)))
+    return lp, cr, same
 
 
 def merge_same_pitch(notes, onsets, tol: float = 0.03):

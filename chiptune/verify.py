@@ -4,7 +4,11 @@
   外れ  : 音の中央 50% の f0 中央値が音符の高さから 1 半音超ずれ、かつその高さが音の中のどこにも歌われていない
           → 安定区間の f0 から高さを取り直す
   短音外れ: 120 ms 未満の音で f0 中央値が 1 半音超ずれ → 高さを取り直す
+  半音外れ: 80 ms 以上の音で、中央 50% の歌が別の半音にはっきり留まっている (中央値が半音の中央 ±0.3、揺れ 0.8 半音以内)
+          → その半音に直す (「隣のキーを押した」誤り。1 半音超の判定では見逃していた)
   併合  : 長い音の中に、音符の高さから 1 半音以上離れた別の高さの安定区間 (120 ms 以上) がある → そこで音を分ける
+  取りこぼし: 歌が 60 ms 以上はっきり 1 つの半音に留まった区間で別の高さが鳴っている (切り替えが早い/遅い、
+          短い音節が隣にのみ込まれる) → その区間をその半音の音にする
 合否は「外れ (短音含む) の割合 <= target」。
 """
 from __future__ import annotations
@@ -14,6 +18,10 @@ import numpy as np
 HOP_S = 0.01
 LONG = 12          # フレーム (120 ms) 以上を「長い音」とする
 MERGE_RUN = 12     # 併合とみなす別音高の安定区間の最短フレーム数
+SEMI_MIN = 8       # 半音外れを調べる最短の音 (80 ms)
+PLATEAU_MIN = 6    # 取りこぼしとみなす、歌が 1 つの半音に留まる最短の長さ (60 ms)
+PLATEAU_NEW_MIN = 10  # これより短い区間は、境界の修正か音節の始まりがある場合だけ音を立てる (100 ms)
+PLATEAU_CHECK = True
 
 
 def _seg(midi, voiced, s, e):
@@ -68,6 +76,20 @@ def check(notes, midi, voiced):
             med = float(np.median(m[v]))
             if abs(med - p) > 1.0:
                 issues.append(dict(idx=i, kind="短音外れ", pitch=_best_pitch(m[v])))
+                continue
+        if issues and issues[-1]["idx"] == i:
+            continue
+        # 半音外れ: 中央 50% で歌がはっきり別の半音に留まっている (安定・半音の中央 ±0.3) のに音符がその隣.
+        # 上の判定 (1 半音超) では「隣のキーを押した」誤りを見逃し、自己検証が合格と報告してしまう
+        if L >= SEMI_MIN:
+            sel = np.zeros(L, bool); sel[L // 4: L - L // 4] = True; sel &= v
+            if sel.sum() >= 5:
+                vals = m[sel]
+                med = float(np.median(vals))
+                q = int(np.round(med))
+                if (q != p and abs(med - q) <= 0.3 and np.percentile(vals, 90) - np.percentile(vals, 10) <= 0.8
+                        and np.mean(np.abs(vals - q) <= 0.5) >= 0.6):
+                    issues.append(dict(idx=i, kind="半音外れ", pitch=q))
     return issues, n_checked
 
 
@@ -77,7 +99,7 @@ def fix(notes, issues, min_len: float = 0.05):
     extra = []
     for it in issues:
         n = notes[it["idx"]]
-        if it["kind"] in ("外れ", "短音外れ"):
+        if it["kind"] in ("外れ", "短音外れ", "半音外れ"):
             n[2] = int(it["pitch"])
         else:  # 併合: 別音高の区間を切り出す
             s0, e0 = n[0], n[1]
@@ -110,7 +132,106 @@ def fix(notes, issues, min_len: float = 0.05):
     return [tuple(n) for n in merged]
 
 
-def verify_loop(notes, midi, voiced, *, max_iter: int = 5, target: float = 0.001, progress=None, log=None):
+def plateaus(midi, voiced, min_len: int = PLATEAU_MIN, tol: float = 0.35, step: float = 0.2, spread: float = 0.6):
+    """歌がはっきり 1 つの半音に留まっている区間 [(開始フレーム, 終了フレーム, 半音)].
+    隣り合うフレームの変化が step 半音以下で、区間の揺れ (最大 - 最小) が spread 以下の有声区間のうち、
+    中央値が半音の中央 ±tol 以内のもの (半音の中央から少しずれて歌われても、安定していれば取る)."""
+    n = len(midi)
+    out = []
+    i = 0
+    while i < n:
+        if not voiced[i]:
+            i += 1
+            continue
+        j = i + 1
+        lo = hi = midi[i]
+        while j < n and voiced[j] and abs(midi[j] - midi[j - 1]) <= step and max(hi, midi[j]) - min(lo, midi[j]) <= spread:
+            lo, hi = min(lo, midi[j]), max(hi, midi[j])
+            j += 1
+        if j - i >= min_len:
+            med = float(np.median(midi[i:j]))
+            if abs(med - np.round(med)) <= tol:
+                out.append((i, j, int(np.round(med))))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def plateau_issues(notes, midi, voiced, onsets=None):
+    """取りこぼし: 歌が 70 ms 以上はっきり留まった半音が、その区間で鳴っていない (隣の音が早く/遅く切り替わる、
+    短い音節が隣の音にのみ込まれる). 区間の中央 60% のうち 6 割以上で別の高さが鳴っていれば問題とする."""
+    if not notes:
+        return []
+    ns = sorted(notes, key=lambda x: x[0])
+    starts = np.array([x[0] for x in ns]); ends = np.array([x[1] for x in ns]); pit = np.array([x[2] for x in ns])
+    frame_pitch = np.full(len(midi), -1)
+    for s_, e_, m_ in zip(starts, ends, pit):
+        frame_pitch[max(0, int(round(s_ / HOP_S))):min(len(midi), int(round(e_ / HOP_S)))] = m_
+    issues = []
+    for a, b, q in plateaus(midi, voiced):
+        L = b - a
+        c0, c1 = a + int(0.2 * L), b - int(0.2 * L)
+        core = frame_pitch[c0:c1]
+        if not len(core) or np.mean(core < 0) >= 0.5:      # 休符の所は扱わない
+            continue
+        # 中央で正しい高さが鳴っていて、区間全体でも (切り替えの遅れ・早まりが 30 ms 程度まで) 鳴っていれば問題なし
+        whole = frame_pitch[a:b]
+        if np.mean(core == q) >= 0.6 and np.sum(whole != q) <= 3:
+            continue
+        # 分離の残渣・オクターブ飛び (前後 2 秒の音域から 10 半音以上外れる) は扱わない
+        near = pit[(ends > a * HOP_S - 2.0) & (starts < b * HOP_S + 2.0)]
+        if len(near) and abs(q - float(np.median(near))) > 10:
+            continue
+        # 短い区間 (100 ms 未満) は装飾 (しゃくりの入り口・経過音) のことが多い。新しい音を立てるのは、
+        # 隣の音がもうその高さで境界をずらすだけで済む場合か、そこに音節の始まりがある場合だけ
+        if L < PLATEAU_NEW_MIN:
+            adjacent_q = np.any(frame_pitch[max(0, a - 3):a] == q) or np.any(frame_pitch[b:b + 3] == q) or np.any(core == q)
+            has_onset = onsets is not None and len(onsets) and np.any((onsets >= a * HOP_S - 0.06) & (onsets <= b * HOP_S))
+            if not (adjacent_q or has_onset):
+                continue
+        issues.append(dict(kind="取りこぼし", span=(a * HOP_S, b * HOP_S), pitch=q))
+    return issues
+
+
+def paint(notes, span, q, min_len: float = 0.03):
+    """区間 span を高さ q の音にする (重なる音は切り詰め/分割し、隣接する q の音とはつなぐ)."""
+    a, b = span
+    out = []
+    template = None
+    for n in sorted(notes, key=lambda x: x[0]):
+        n = list(n)
+        if n[1] <= a or n[0] >= b:
+            out.append(n)
+            continue
+        template = template or n
+        if n[0] < a and a - n[0] >= min_len:
+            out.append([n[0], a] + n[2:])
+        if n[1] > b and n[1] - b >= min_len:
+            out.append([b, n[1]] + n[2:])
+    if template is None:
+        return [tuple(n) for n in notes]
+    new = [a, b, int(q)] + list(template[3:])
+    if len(new) > 4:
+        new[4] = True
+    out.append(new)
+    out.sort(key=lambda x: x[0])
+    merged = []
+    for n in out:
+        if merged and merged[-1][2] == n[2] and n[0] - merged[-1][1] < 0.02 and (a - 0.02 <= n[0] <= b + 0.02 or a - 0.02 <= merged[-1][1] <= b + 0.02):
+            merged[-1][1] = max(merged[-1][1], n[1])
+            if len(n) > 4:
+                merged[-1][4] = n[4]
+        else:
+            merged.append(n)
+    # 重なりの解消
+    for i in range(1, len(merged)):
+        if merged[i][0] < merged[i - 1][1]:
+            merged[i - 1][1] = merged[i][0]
+    return [tuple(n) for n in merged if n[1] - n[0] >= 0.01]
+
+
+def verify_loop(notes, midi, voiced, *, max_iter: int = 5, target: float = 0.001, progress=None, log=None, onsets=None):
     """検証 → 修正 を繰り返す. 戻り値: (notes, report)
     report = dict(iterations, passed, rate, n_bad, n_checked, target, history=[{iter, n_bad, n_merge, rate}])"""
     history = []
@@ -119,6 +240,8 @@ def verify_loop(notes, midi, voiced, *, max_iter: int = 5, target: float = 0.001
     rate = 0.0; n_bad = 0; n_checked = 0
     for k in range(max_iter + 1):
         issues, n_checked = check(cur, midi, voiced)
+        if PLATEAU_CHECK:
+            issues = issues + plateau_issues(cur, midi, voiced, None if onsets is None else np.asarray(onsets, float))
         bad = [x for x in issues if x["kind"] != "併合"]
         merges = [x for x in issues if x["kind"] == "併合"]
         n_bad = len(bad)
@@ -135,6 +258,9 @@ def verify_loop(notes, midi, voiced, *, max_iter: int = 5, target: float = 0.001
         if k == max_iter:
             passed = rate <= target
             break
-        cur = fix(cur, issues)
+        cur = fix(cur, [x for x in issues if x["kind"] != "取りこぼし"])
+        for it in issues:
+            if it["kind"] == "取りこぼし":
+                cur = paint(cur, it["span"], it["pitch"])
     return cur, dict(iterations=len(history) - 1, passed=passed, rate=rate, n_bad=n_bad, n_checked=n_checked,
                      target=target, max_iter=max_iter, history=history)

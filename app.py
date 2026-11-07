@@ -128,7 +128,8 @@ async def convert_url(
     background: BackgroundTasks,
     url: str = Form(...),
     mode: str = Form("auto"),
-    duty: float = Form(0.5),
+    duty: float = Form(0.25),
+    melody_style: str = Form("crisp"),
     arpeggio: bool = Form(True),
     arp_speed: int = Form(1),
     drums: bool = Form(True),
@@ -147,6 +148,9 @@ async def convert_url(
 ):
     opts = _parse_opts(mode, duty, arpeggio, arp_speed, drums, bass, crunch, fmt,
                        sensitivity, tempo_mult, fill_gaps, key_snap, echo, melody_octave, quantize, trim_intro)
+    if melody_style not in ("crisp", "voice", "voice_cont", "follow", "notes"):
+        raise HTTPException(400, "melody_style は crisp / voice / voice_cont / follow / notes")
+    opts.melody_style = melody_style
     if not is_url(url):
         raise HTTPException(400, "URL の形式が正しくありません (https://... で始めてください)")
     job_id = job_id or uuid.uuid4().hex
@@ -172,7 +176,8 @@ async def convert(
     background: BackgroundTasks,
     file: UploadFile = File(...),
     mode: str = Form("auto"),
-    duty: float = Form(0.5),
+    duty: float = Form(0.25),
+    melody_style: str = Form("crisp"),
     arpeggio: bool = Form(True),
     arp_speed: int = Form(1),
     drums: bool = Form(True),
@@ -188,9 +193,14 @@ async def convert(
     melody_octave: int = Form(0),
     quantize: bool = Form(True),
     trim_intro: bool = Form(True),
+    song_title: str = Form(""),
 ):
     opts = _parse_opts(mode, duty, arpeggio, arp_speed, drums, bass, crunch, fmt,
                        sensitivity, tempo_mult, fill_gaps, key_snap, echo, melody_octave, quantize, trim_intro)
+    if melody_style not in ("crisp", "voice", "voice_cont", "follow", "notes"):
+        raise HTTPException(400, "melody_style は crisp / voice / voice_cont / follow / notes")
+    opts.melody_style = melody_style
+    opts.song_title = song_title.strip()[:200] or None
     job_id = job_id or uuid.uuid4().hex
     work = Path(tempfile.mkdtemp(prefix="8bit_"))
     src_name = Path(file.filename or "input.mp4").name

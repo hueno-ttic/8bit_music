@@ -11,7 +11,19 @@ SONGS = CACHE / "testsongs"
 FEAT = CACHE / "feat"
 IDS = {"greenlights": "XSLhsjepelI", "aisarenakutemo": "ygY2qObZv24", "sand_planet": "AS4q9yaWJkI",
        "39music": "OuLZlZ18APQ", "hand_in_hand": "RKtoreimcQ8", "bless_mv": "a-Nf3QUFkOU",
-       "future_eve": "7j0mQH0BtEU", "tenchi_kaibyaku": "8J6SMoVd5BY"}
+       "future_eve": "7j0mQH0BtEU", "tenchi_kaibyaku": "8J6SMoVd5BY",
+       # 調整に使っていない検証用 (held-out)
+       "senbonzakura": "shs0rAiwsGQ", "shoushitsu": "VWVtIg5cdDU", "roki": "Xg-qfsKN2_E",
+       "vampire": "e1xCOsgWG0M", "matryoshka": "HOz-9FzIDf0"}
+HELDOUT = ["senbonzakura", "shoushitsu", "roki", "vampire", "matryoshka"]
+# 音節オンセット検出器 (chiptune/onset_model) の学習だけに使う曲 (Songle に歌詞タイミングがあるもの)
+TRAIN_EXTRA = {"hibana": "hxSg2Ioz3LM", "ghost_rule": "KushW6zvazM", "aikotoba3": "WptXk39wiIQ",
+               "unknown_mothergoose": "P_CSdxSGfaA", "inochi": "0HYm60Mjm0k", "karakuri": "xxFkW3PCT5M",
+               "donut_hole": "qnX2CdOBcDI", "kamippoina": "EHBFKhLUVig", "phony": "9QLT1Aw_45s",
+               "king": "cm-l2h6GB8Q", "rettou": "oEkGC2HV7rc", "teo": "bmkY2yc1K7Q", "lower": "3sEptl-psU0",
+               "tell_your_world": "PqJNc9KVIZE", "melty": "ZEy36W1xX8c", "shanti": "POy0RvJeaqM",
+               "happy_synth": "xOKplMgHxxA"}
+IDS.update(TRAIN_EXTRA)
 SR = 22050
 HOP_S = 0.01
 
@@ -79,3 +91,29 @@ def cells16_from_beats(beats: list[dict], duration: float) -> tuple[np.ndarray, 
         tcur += d; p = p % 4 + 1
     cells.append(tcur)
     return np.array(cells), np.array(cpos)
+
+
+def fcpe_f0(slug: str) -> np.ndarray:
+    """評価用の 2 つ目の f0 (FCPE, 10 ms, 無声=0)。RMVPE と一致するフレームだけを正解として信用するのに使う
+    (2 つの推定器が 0.5 半音以内で一致しない所は、分離の残渣・オクターブ飛びの疑い)."""
+    FEAT.mkdir(parents=True, exist_ok=True)
+    fp = FEAT / f"{slug}_fcpe.npy"
+    if fp.exists():
+        return np.load(fp)
+    import librosa
+    import torch
+    from torchfcpe import spawn_bundled_infer_model
+    from chiptune.audio_io import load_mono
+    from chiptune.separation import separate
+    y = load_mono(SONGS / f"{slug}.webm", sr=SR)
+    y = y / (np.abs(y).max() + 1e-9)
+    voc = separate(y, SR)["vocals"]
+    x = librosa.resample(voc.astype(np.float32), orig_sr=SR, target_sr=16000)
+    model = spawn_bundled_infer_model(device="cpu")
+    n = len(features(slug)["t"])
+    with torch.no_grad():
+        f0 = model.infer(torch.from_numpy(x)[None, :, None], sr=16000, decoder_mode="local_argmax", threshold=0.006,
+                         f0_min=60, f0_max=1400, interp_uv=False, output_interp_target_length=n)
+    f0 = f0[0, :, 0].cpu().numpy().astype(np.float64)
+    np.save(fp, f0)
+    return f0

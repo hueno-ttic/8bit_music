@@ -408,3 +408,69 @@ def merge_passing_notes(notes, max_len: float = 0.09):
         out.append(n)
         i += 1
     return out
+
+
+def defragment(notes, min_len: float = 0.07, max_gap: float = 0.02, tiny: float = 0.05):
+    """細切れの音 (min_len 秒未満) を隣にまとめる。8bit で鳴らすと、短い音の連続はブツブツ途切れて聞こえるため.
+       - 隙間なく隣り合う同じ高さの音があれば、それと 1 音にする (同じ高さの断片)
+       - 前後の音の間の高さの短い音 (音の移り目のしゃくり・経過音) は、次の音 (着地先) に吸収する
+       - tiny 秒未満の切れ端は、長い方の隣の音に含める
+    notes: [(start, end, midi, vel, legato, ...)] (start 順でなくてよい). 戻り値も同じ形式."""
+    ns = [list(n) for n in sorted(notes, key=lambda n: n[0])]
+    changed = True
+    while changed:
+        changed = False
+        for i, n in enumerate(ns):
+            if n[1] - n[0] >= min_len:
+                continue
+            prev = ns[i - 1] if i > 0 and n[0] - ns[i - 1][1] < max_gap else None
+            nxt = ns[i + 1] if i + 1 < len(ns) and ns[i + 1][0] - n[1] < max_gap else None
+            if prev is not None and prev[2] == n[2]:
+                prev[1] = n[1]
+                if len(n) > 4 and len(prev) > 4:
+                    prev[4] = n[4]
+            elif nxt is not None and nxt[2] == n[2]:
+                nxt[0] = n[0]
+            elif prev is not None and nxt is not None and min(prev[2], nxt[2]) < n[2] < max(prev[2], nxt[2]):
+                nxt[0] = n[0]
+            elif n[1] - n[0] < tiny and (prev is not None or nxt is not None):
+                # 修正で残ったごく短い切れ端は、長い方の隣の音に含める
+                if nxt is None or (prev is not None and prev[1] - prev[0] >= nxt[1] - nxt[0]):
+                    prev[1] = n[1]
+                else:
+                    nxt[0] = n[0]
+            else:
+                continue
+            del ns[i]
+            changed = True
+            break
+    return [tuple(n) for n in ns]
+
+
+def refine_boundaries(notes, midi, voiced, max_shift: float = 0.08, min_len: float = 0.04, max_gap: float = 0.02):
+    """高さの違う 2 音の境界を、歌の f0 が 2 つの音の中間を横切る時刻 (±max_shift 秒以内で最も近い所) に移す.
+    格子に乗せた境界は実際の音の変わり目から数十 ms ずれることがあり、短い音節ではその間ずっと隣の音が鳴ってしまう."""
+    ns = [list(n) for n in sorted(notes, key=lambda n: n[0])]
+    T = len(midi)
+    for i in range(len(ns) - 1):
+        a, b = ns[i], ns[i + 1]
+        if b[0] - a[1] > max_gap or abs(b[2] - a[2]) < 1:
+            continue
+        mid = 0.5 * (a[2] + b[2])
+        up = b[2] > a[2]
+        bnd = b[0]
+        lo = max(int((bnd - max_shift) / HOP_S), int((a[0] + min_len) / HOP_S), 1)
+        hi = min(int((bnd + max_shift) / HOP_S), int((b[1] - min_len) / HOP_S), T - 1)
+        best = None
+        for f in range(lo, hi + 1):
+            if not (voiced[f] and voiced[f - 1]):
+                continue
+            crossed = (midi[f - 1] < mid <= midi[f]) if up else (midi[f - 1] > mid >= midi[f])
+            if crossed and (best is None or abs(f * HOP_S - bnd) < abs(best * HOP_S - bnd)):
+                best = f
+        if best is not None:
+            t_new = best * HOP_S
+            a[1] = t_new + (a[1] - b[0])     # 隙間はそのまま保つ
+            b[0] = t_new
+    return [tuple(n) for n in ns]
+
