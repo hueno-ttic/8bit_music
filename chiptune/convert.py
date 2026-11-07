@@ -63,6 +63,24 @@ def _pick_mode(mode: str) -> str:
     return "dsp"
 
 
+def _fit_mode_to_budget(mode: str, y: np.ndarray, report) -> str:
+    """締め切りまでに歌の分離が終わらない見込みなら、速いモード (basic-pitch, 3 分の曲で 15 秒ほど) に切り替える."""
+    from . import budget, separation
+    if mode != "sep" or budget.remaining() == float("inf"):
+        return mode
+    if separation.is_cached(y, SR):
+        need = 60.0
+    else:
+        dur = len(y) / SR
+        need = (15 + 0.12 * dur if separation._device() != "cpu" else 30 + 0.8 * dur) + 60.0
+    if budget.enough(need):
+        return mode
+    from . import analysis_ml
+    fallback = "ml" if analysis_ml.is_available() else "dsp"
+    report(f"時間内に歌の分離が終わらない見込みなので、速いモード ({fallback}) で採譜します")
+    return fallback
+
+
 def verify_summary(vr: dict) -> str:
     """自己検証レポートを 1 行にする (UI とログ用)."""
     if vr.get("passed"):
@@ -95,12 +113,16 @@ def convert_file(src: str | Path, dst: str | Path, opts: ConvertOptions | None =
         report("音声を取り出しています…")
         y = load_mono(src, SR)
         mode = _pick_mode(opts.mode)
+        mode = _fit_mode_to_budget(mode, y, report)
         report(f"採譜しています… (mode={mode})")
     if mode == "midi":
         pass
     elif mode == "sep":
         from .analysis_sep import analyze_sep
-        if opts.song_title and not opts.source_url:
+        from . import budget
+        if opts.song_title and not opts.source_url and not budget.enough(100):
+            report("時間が足りないので、曲名での Songle の照合を省きます")
+        elif opts.song_title and not opts.source_url:
             from . import songle_match
             try:
                 m = songle_match.find(y, SR, opts.song_title, progress=report)

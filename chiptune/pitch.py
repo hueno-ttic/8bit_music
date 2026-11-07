@@ -23,7 +23,9 @@ def rmvpe_weights() -> Path:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
         log.info("RMVPE の重み (約 180MB) をダウンロードしています…")
         tmp = p.with_suffix(".part")
-        urllib.request.urlretrieve(RMVPE_URL, tmp)
+        with urllib.request.urlopen(RMVPE_URL, timeout=30) as r, open(tmp, "wb") as f:
+            while chunk := r.read(1 << 20):
+                f.write(chunk)
         tmp.rename(p)
     return p
 

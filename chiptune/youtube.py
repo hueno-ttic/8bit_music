@@ -49,6 +49,11 @@ def download_audio(url: str, out_dir: str | Path, progress=None) -> tuple[Path, 
         "no_warnings": True,
         "progress_hooks": [hook],
         "max_filesize": 200 * 1024 * 1024,
+        # 応答しない接続で待ち続けないように (Web アプリは 1 曲を 3 分以内に返す)
+        "socket_timeout": 15,
+        "retries": 2,
+        "fragment_retries": 2,
+        "extractor_retries": 1,
     }
     rt = _js_runtimes()
     if rt:

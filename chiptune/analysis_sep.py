@@ -373,13 +373,24 @@ def prefer_top_voice(f0: np.ndarray, y: np.ndarray, sr: int, hop: float = 0.01) 
     return out
 
 
+_VF0_CACHE: dict = {}
+
+
 def vocal_f0(y: np.ndarray, sr: int):
-    """歌ステムの f0 (Hz, 10 ms, 無声=0)・音量・エネルギー. 楽譜モデルの経路で共通に使う."""
+    """歌ステムの f0 (Hz, 10 ms, 無声=0)・音量・エネルギー. 楽譜モデルの経路で共通に使う.
+    同じ歌ステムに対しては 1 回の解析の中で 1 度だけ計算する (RMVPE と多声採譜で 15〜25 秒かかる)."""
+    key = (id(y), y.shape, float(np.sum(y[::997])), sr, F0_THRED, F0_GATE, F0_OCTAVE_FIX, TOP_VOICE)
+    if key in _VF0_CACHE:
+        return _VF0_CACHE[key]
+    from . import budget
     from . import notes as N
     from .pitch import rmvpe_f0
     t, f0 = rmvpe_f0(y, sr, thred=F0_THRED)
     if TOP_VOICE:
-        f0 = prefer_top_voice(f0, y, sr)
+        if budget.enough(70):
+            f0 = prefer_top_voice(f0, y, sr)
+        else:
+            log.info("時間が足りないので、ハモリの上の声の選び直しを省きます")
     rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=int(round(N.HOP_S * sr)))[0]
     n = min(len(f0), len(rms)); t, f0, rms = t[:n], f0[:n], rms[:n]
     ref = np.percentile(rms, 95) + 1e-9
@@ -389,6 +400,8 @@ def vocal_f0(y: np.ndarray, sr: int):
         mm = fix_octave_jumps(librosa.hz_to_midi(np.maximum(f0, 1e-3)), v)
         f0 = np.where(v, librosa.midi_to_hz(mm), 0.0)
     energy = np.clip(0.5 + 0.5 * rms / ref, 0.4, 1.0)
+    _VF0_CACHE.clear()
+    _VF0_CACHE[key] = (t, f0, rms, energy)
     return t, f0, rms, energy
 
 

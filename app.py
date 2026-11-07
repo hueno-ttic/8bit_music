@@ -8,6 +8,7 @@ import json
 import logging
 import shutil
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 
@@ -16,9 +17,9 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from chiptune import ConvertOptions, convert_file
-from chiptune import analysis_ml, separation
-from chiptune.youtube import download_audio, is_url
+from chiptune import ConvertOptions
+from chiptune import analysis_ml, jobrun, separation
+from chiptune.youtube import is_url
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("app")
@@ -89,15 +90,30 @@ def _parse_opts(mode: str, duty: float, arpeggio: bool, arp_speed: int, drums: b
                           fill_gaps=fill_gaps, key_snap=key_snap, echo=echo, melody_octave=melody_octave, quantize=quantize, trim_intro=trim_intro)
 
 
-async def _run_job(job_id: str, work: Path, src: Path, stem: str, opts: ConvertOptions,
-                   background: BackgroundTasks):
-    """変換を実行してダウンロード用レスポンスを返す (アップロード / URL 共通)."""
-    def progress(msg: str):
-        JOBS[job_id]["message"] = msg
+# 変換は 1 つずつ順番に実行する (同時に 2 つ動かすと、GPU (MPS) を使う歌の分離でプロセスごと落ちた)
+_JOB_LOCK = threading.Lock()
 
-    dst = work / f"{stem}_8bit.{opts.fmt}"
+
+def _run_locked(job_id: str, kind: str, payload: str, work: Path, stem: str, opts: ConvertOptions):
+    def progress(msg: str):
+        if job_id in JOBS:
+            JOBS[job_id]["message"] = msg
+
+    if not _JOB_LOCK.acquire(blocking=False):
+        progress("ほかの曲の変換が終わるのを待っています…")
+        _JOB_LOCK.acquire()
     try:
-        out = await run_in_threadpool(convert_file, src, dst, opts, progress)
+        return jobrun.run(kind, payload, work, stem, opts, progress)
+    finally:
+        _JOB_LOCK.release()
+
+
+async def _run_job(job_id: str, work: Path, kind: str, payload: str, stem: str, opts: ConvertOptions,
+                   background: BackgroundTasks):
+    """変換を実行してダウンロード用レスポンスを返す (アップロード / URL 共通).
+    別プロセスで最長 3 分弱 (chiptune.jobrun) で実行し、時間内に終わらなければ速いモードで作り直す."""
+    try:
+        out, vr, _ = await run_in_threadpool(_run_locked, job_id, kind, payload, work, stem, opts)
     except Exception as e:  # noqa: BLE001
         log.exception("conversion failed")
         JOBS[job_id] = {"status": "error", "message": str(e)}
@@ -106,8 +122,6 @@ async def _run_job(job_id: str, work: Path, src: Path, stem: str, opts: ConvertO
 
     JOBS[job_id]["status"] = "done"
     media = {"mp3": "audio/mpeg", "midi": "audio/midi"}.get(opts.fmt, "audio/wav")
-    from chiptune import convert as _cv
-    vr = _cv.LAST_VERIFY_REPORT
     headers = {}
     if vr:
         # 自己検証の結果をヘッダで UI に渡す (ASCII のみ)
@@ -156,19 +170,8 @@ async def convert_url(
     job_id = job_id or uuid.uuid4().hex
     work = Path(tempfile.mkdtemp(prefix="8bit_"))
     JOBS[job_id] = {"status": "running", "message": "YouTube からダウンロード中…", "dir": str(work)}
-
-    def progress(msg: str):
-        JOBS[job_id]["message"] = msg
-
-    try:
-        src, title = await run_in_threadpool(download_audio, url, work, progress)
-    except Exception as e:  # noqa: BLE001
-        log.exception("download failed")
-        JOBS[job_id] = {"status": "error", "message": str(e)}
-        shutil.rmtree(work, ignore_errors=True)
-        return JSONResponse({"error": str(e)}, status_code=500)
     opts.source_url = url.strip()
-    return await _run_job(job_id, work, src, title, opts, background)
+    return await _run_job(job_id, work, "url", url.strip(), "youtube", opts, background)
 
 
 @app.post("/api/convert")
@@ -215,4 +218,4 @@ async def convert(
             f.write(chunk)
 
     JOBS[job_id] = {"status": "running", "message": "開始", "dir": str(work)}
-    return await _run_job(job_id, work, src, Path(src_name).stem, opts, background)
+    return await _run_job(job_id, work, "file", str(src), Path(src_name).stem, opts, background)

@@ -56,6 +56,12 @@ def _cache_key(y: np.ndarray, sr: int) -> str:
     return h.hexdigest()[:20]
 
 
+def is_cached(y: np.ndarray, sr: int) -> bool:
+    """この音声の分離結果がキャッシュにあるか (analyze_sep と同じく最大値で正規化した音声で判定)."""
+    yn = y / (np.abs(y).max() + 1e-9)
+    return (CACHE_DIR / f"{_cache_key(yn, sr)}.npz").exists()
+
+
 def separate(y: np.ndarray, sr: int, progress=None, use_cache: bool = True) -> dict[str, np.ndarray]:
     """モノラル y (sr Hz) を分離し、各ステムをモノラル・同じ sr で返す."""
     import torch

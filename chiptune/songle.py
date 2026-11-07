@@ -25,7 +25,7 @@ NAMES = "C C# D D# E F F# G G# A A# B".split()
 FLAT = {"Db": "C#", "Eb": "D#", "Gb": "F#", "Ab": "G#", "Bb": "A#", "Cb": "B", "Fb": "E"}
 
 
-def _get(url: str, timeout: float = 30.0):
+def _get(url: str, timeout: float = 10.0):
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = r.read()
@@ -144,10 +144,14 @@ def lyrics_chars(url: str, offset: float = 0.0) -> list[tuple[float, float]] | N
     if not isinstance(d, dict) or not d.get("data"):
         return None
     out = []
-    for phrase in d["data"]:
-        for word in phrase:
-            for ch in word:
-                s, e = float(ch["start_time"]), float(ch["end_time"])
+    for phrase in d["data"] or []:
+        for word in phrase or []:
+            for ch in word or []:
+                # 時刻が付いていない文字 (歌詞だけ登録されて未同期の部分) がある曲もある
+                try:
+                    s, e = float(ch["start_time"]), float(ch["end_time"])
+                except (TypeError, ValueError, KeyError):
+                    continue
                 if e > s:
                     out.append((s, e))
     out.sort()

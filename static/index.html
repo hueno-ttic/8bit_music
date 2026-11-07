@@ -191,7 +191,7 @@
     仕組み: 曲からメロディ・ベース・コード・ドラムを聞き取り、ファミコンの 4 チャンネル
     (矩形波 ×2 / 三角波 / ノイズ) で演奏し直しています。元の音を加工するのではなく「耳コピして打ち込み直す」方式なので、
     ボーカルが複雑な曲ほどメロディの取りこぼしが出ます。うまくいかないときは音色やモードを変えて試してみてください。
-    ボーカル分離モードは、歌・ドラム・ベース・その他に分けてから各パートを採譜するので主旋律の精度が高く、4 分の曲で 1〜2 分かかります。YouTube の URL を使う場合は 20 分以内の動画に対応しています。
+    ボーカル分離モードは、歌・ドラム・ベース・その他に分けてから各パートを採譜するので主旋律の精度が高く、4 分の曲で 1〜2 分かかります (どの曲も最長 3 分で返します。時間内に終わらない場合は速いモードで作り直します)。YouTube の URL を使う場合は 20 分以内の動画に対応しています。
   </p>
 </main>
 
@@ -288,15 +288,18 @@ function showVerify(h) {
   box.style.display = "block";
 }
 
-let pollTimer = null;
+let pollTimer = null, jobStart = 0, lastMsg = "";
+const CLIENT_TIMEOUT_MS = 200000;   // サーバーは 3 分弱で必ず返す。これを過ぎたら待つのをやめる
 async function poll(jobId) {
+  const sec = Math.round((Date.now() - jobStart) / 1000);
   try {
     const r = await fetch(`${API}/api/jobs/${jobId}`);
     if (r.ok) {
       const j = await r.json();
-      if (j.status === "running") status.textContent = j.message;
+      if (j.status === "running") lastMsg = j.message;
     }
   } catch (_) {}
+  status.textContent = `${lastMsg} (${sec} 秒経過)`;
 }
 
 go.addEventListener("click", async () => {
@@ -330,10 +333,21 @@ go.addEventListener("click", async () => {
   status.className = "status";
   status.textContent = picked ? "アップロード中…" : "YouTube からダウンロード中…";
   bar.style.display = "block";
+  jobStart = Date.now();
+  lastMsg = status.textContent;
   pollTimer = setInterval(() => poll(jobId), 800);
+  const ac = new AbortController();
+  const abortTimer = setTimeout(() => ac.abort(), CLIENT_TIMEOUT_MS);
 
   try {
-    const r = await fetch(`${API}` + (picked ? "/api/convert" : "/api/convert_url"), { method: "POST", body: fd });
+    let r;
+    try {
+      r = await fetch(`${API}` + (picked ? "/api/convert" : "/api/convert_url"), { method: "POST", body: fd, signal: ac.signal });
+    } catch (err) {
+      throw new Error(err.name === "AbortError"
+        ? "3 分を過ぎても応答がありません。手元のサーバー (./run.sh) のログを確認してください"
+        : "サーバーとの接続が切れました。手元のサーバー (./run.sh) が動いているか確認してください");
+    }
     if (!r.ok) {
       let msg = `エラー (${r.status})`;
       try { const j = await r.json(); msg = j.error || j.detail || msg; } catch (_) {}
@@ -358,6 +372,7 @@ go.addEventListener("click", async () => {
     status.className = "status err";
     status.textContent = "失敗: " + e.message;
   } finally {
+    clearTimeout(abortTimer);
     clearInterval(pollTimer);
     bar.style.display = "none";
     refreshButton();
